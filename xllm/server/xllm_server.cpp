@@ -245,6 +245,10 @@ void XllmServer::run() {
 }
 
 void XllmServer::stop() {
+  if (!server_) {
+    return;
+  }
+
   server_->Stop(0);
   server_->Join();
 }

@@ -46,7 +46,7 @@ limitations under the License.
 #include "server/xllm_server_registry.h"
 using namespace xllm;
 
-static std::atomic<uint32_t> signal_received{0};
+static volatile std::sig_atomic_t signal_received = 0;
 
 static std::unordered_set<std::string> deepseek_like_model_set = {
     "deepseek_v2",
@@ -65,9 +65,9 @@ static const std::unordered_set<std::string> prefill_sp_supported_model_set = {
     "glm_moe_dsa"};
 
 void shutdown_handler(int signal) {
-  // TODO: gracefully shutdown the server
-  LOG(WARNING) << "Received signal " << signal << ", stopping server...";
-  exit(1);
+  if (signal_received == 0) {
+    signal_received = signal;
+  }
 }
 
 std::string get_model_backend(const std::filesystem::path& model_path) {
@@ -383,6 +383,11 @@ int run() {
     }
   }
 
+  auto received_signal = signal_received;
+  if (received_signal != 0) {
+    LOG(WARNING) << "Received signal " << received_signal << ", server exited.";
+  }
+
   return 0;
 }
 
@@ -401,6 +406,10 @@ int main(int argc, char** argv) {
   google::ParseCommandLineFlags(&argc, &argv, true);
 
   google::InitGoogleLogging("xllm");
+
+  std::signal(SIGINT, shutdown_handler);
+  std::signal(SIGTERM, shutdown_handler);
+  std::signal(SIGHUP, shutdown_handler);
 
   // Check if model path is provided
   if (FLAGS_model.empty()) {
