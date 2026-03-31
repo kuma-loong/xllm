@@ -276,6 +276,10 @@ TEST(HFModelLoaderTest, LLaDARealModelDirectoryLoadsArgsAndTokenizer) {
   EXPECT_EQ(tokenizer_args.tokenizer_type(), "fast");
   EXPECT_EQ(tokenizer_args.tokenizer_class(), "PreTrainedTokenizerFast");
   EXPECT_FALSE(tokenizer_args.chat_template().empty());
+  EXPECT_NE(tokenizer_args.chat_template().find("<role>SYSTEM</role>"),
+            std::string::npos);
+  EXPECT_NE(tokenizer_args.chat_template().find("add_generation_prompt"),
+            std::string::npos);
   EXPECT_EQ(tokenizer_args.bos_token(), "<|startoftext|>");
   EXPECT_EQ(tokenizer_args.eos_token(), "<|endoftext|>");
 }

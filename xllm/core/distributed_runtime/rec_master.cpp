@@ -538,8 +538,8 @@ RecMaster::RecMaster(const Options& options)
   scheduler_ = create_fixed_steps_scheduler(engine_.get(), scheduler_options);
 
   chat_template_ = nullptr;
-  // Initialize chat template and tokenizer for LlmRec (Qwen3).
-  if (rec_type_ == RecType::kLlmRec) {
+  // Initialize chat template and tokenizer for chat-capable rec models.
+  if (rec_type_ == RecType::kLlmRec || rec_type_ == RecType::kLLaDARec) {
     chat_template_ =
         std::make_unique<JinjaChatTemplate>(engine_->tokenizer_args());
     tokenizer_ = engine_->tokenizer()->clone();
@@ -645,9 +645,9 @@ void RecMaster::handle_request(
                             : init_error_message_);
     return;
   }
-  if (rec_type_ != RecType::kLlmRec) {
+  if (rec_type_ != RecType::kLlmRec && rec_type_ != RecType::kLLaDARec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Chat is only supported for LLMRec models");
+                        "Chat is only supported for LLMRec/LLaDARec models");
     return;
   }
 

@@ -17,7 +17,65 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <filesystem>
+
+#include "core/util/json_reader.h"
+
 namespace xllm {
+
+namespace {
+
+std::filesystem::path find_llada_model_dir() {
+  auto current = std::filesystem::current_path();
+  for (int i = 0; i < 8; ++i) {
+    auto candidate = current / "models" / "LLaDA2.1-mini";
+    if (std::filesystem::exists(candidate / "tokenizer_config.json")) {
+      return candidate;
+    }
+    if (current == current.root_path()) {
+      break;
+    }
+    current = current.parent_path();
+  }
+  return {};
+}
+
+std::string normalize_ws(std::string text) {
+  text.erase(std::remove_if(text.begin(),
+                            text.end(),
+                            [](unsigned char ch) {
+                              return ch == ' ' || ch == '\n' || ch == '\r' ||
+                                     ch == '\t';
+                            }),
+             text.end());
+  return text;
+}
+
+TokenizerArgs make_llada_tokenizer_args() {
+  const auto model_dir = find_llada_model_dir();
+  if (model_dir.empty()) {
+    return {};
+  }
+
+  JsonReader reader;
+  const auto tokenizer_config_path = model_dir / "tokenizer_config.json";
+  EXPECT_TRUE(reader.parse(tokenizer_config_path.string()));
+
+  TokenizerArgs args;
+  if (auto v = reader.value<std::string>("chat_template")) {
+    args.chat_template() = v.value();
+  }
+  if (auto v = reader.value<std::string>("bos_token")) {
+    args.bos_token() = v.value();
+  }
+  if (auto v = reader.value<std::string>("eos_token")) {
+    args.eos_token() = v.value();
+  }
+  return args;
+}
+
+}  // namespace
 
 class TestableJinjaChatTemplate : public JinjaChatTemplate {
  public:
@@ -59,6 +117,60 @@ TEST(JinjaChatTemplate, OpenChatModel) {
   ASSERT_TRUE(result.has_value());
 
   EXPECT_EQ(result.value(), expected);
+}
+
+TEST(JinjaChatTemplate, LLaDATemplateSystemAndUser) {
+  const auto model_dir = find_llada_model_dir();
+  if (model_dir.empty()) {
+    GTEST_SKIP() << "LLaDA2.1-mini local model directory not found";
+  }
+
+  TokenizerArgs args = make_llada_tokenizer_args();
+  TestableJinjaChatTemplate template_(args);
+  const ChatMessages messages = {
+      Message("system", "sys"),
+      Message("user", "u1"),
+  };
+
+  auto result = template_.apply(messages);
+  ASSERT_TRUE(result.has_value());
+
+  const std::string expected =
+      "<role>SYSTEM</role>\n"
+      "sys\n"
+      "detailed thinking off<|role_end|>"
+      "<role>HUMAN</role>u1<|role_end|>"
+      "<role>ASSISTANT</role>";
+  EXPECT_EQ(normalize_ws(result.value()), normalize_ws(expected));
+}
+
+TEST(JinjaChatTemplate, LLaDATemplateWithAssistantHistory) {
+  const auto model_dir = find_llada_model_dir();
+  if (model_dir.empty()) {
+    GTEST_SKIP() << "LLaDA2.1-mini local model directory not found";
+  }
+
+  TokenizerArgs args = make_llada_tokenizer_args();
+  TestableJinjaChatTemplate template_(args);
+  const ChatMessages messages = {
+      Message("system", "sys"),
+      Message("user", "u1"),
+      Message("assistant", "a1"),
+      Message("user", "u2"),
+  };
+
+  auto result = template_.apply(messages);
+  ASSERT_TRUE(result.has_value());
+
+  const std::string expected =
+      "<role>SYSTEM</role>\n"
+      "sys\n"
+      "detailed thinking off<|role_end|>"
+      "<role>HUMAN</role>u1<|role_end|>"
+      "<role>ASSISTANT</role>a1<|role_end|>"
+      "<role>HUMAN</role>u2<|role_end|>"
+      "<role>ASSISTANT</role>";
+  EXPECT_EQ(normalize_ws(result.value()), normalize_ws(expected));
 }
 
 }  // namespace xllm
