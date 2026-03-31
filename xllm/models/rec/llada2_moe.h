@@ -73,6 +73,4 @@ REGISTER_MODEL_ARGS(llada2_moe, [&] {
   }
 });
 
-REGISTER_TOKENIZER_ARGS(llada2_moe, [&] { SET_ARG(tokenizer_type, "fast"); });
-
 }  // namespace xllm

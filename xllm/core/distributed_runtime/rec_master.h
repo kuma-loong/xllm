@@ -18,6 +18,7 @@ limitations under the License.
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <string>
 #include <thread>
 
 #include "framework/chat_template/jinja_chat_template.h"
@@ -168,6 +169,8 @@ class RecMaster : public Master {
   // model args
   ModelArgs model_args_;
   RecType rec_type_ = RecType::kNone;
+  bool initialized_ = false;
+  std::string init_error_message_;
   std::unique_ptr<ThreadPool> threadpool_;
   std::unique_ptr<Tokenizer> tokenizer_;
   // chat template instance
