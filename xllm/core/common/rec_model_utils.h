@@ -26,6 +26,7 @@ enum class RecModelKind : int8_t {
   kNone = 0,
   kOneRec = 1,
   kLlmRec = 2,
+  kLLaDARec = 3,
 };
 
 // Pipeline strategy types (extensible for future strategies)
@@ -34,6 +35,7 @@ enum class RecPipelineType : uint8_t {
   kLlmRecWithMmData = 1,          // LlmRec with mm_data (qwen + embedding)
   kOneRecDefault = 2,             // OneRec
   kLlmRecMultiRoundPipeline = 3,  // LlmRec multi-round pipeline (device loop)
+  kLLaDARecWorkerLoop = 4,        // LLaDA worker-driven generation loop
 };
 
 // Check if Rec multi-round mode is enabled.
@@ -58,6 +60,8 @@ inline RecPipelineType get_rec_pipeline_type(RecModelKind kind) {
       }
     case RecModelKind::kOneRec:
       return RecPipelineType::kOneRecDefault;
+    case RecModelKind::kLLaDARec:
+      return RecPipelineType::kLLaDARecWorkerLoop;
     default:
       return RecPipelineType::kLlmRecDefault;
   }
@@ -72,12 +76,19 @@ inline constexpr bool is_llmrec_model_type(std::string_view model_type) {
          model_type == "qwen3_moe";
 }
 
+inline constexpr bool is_llada_rec_model_type(std::string_view model_type) {
+  return model_type == "llada2_moe";
+}
+
 inline constexpr RecModelKind get_rec_model_kind(std::string_view model_type) {
   if (is_onerec_model_type(model_type)) {
     return RecModelKind::kOneRec;
   }
   if (is_llmrec_model_type(model_type)) {
     return RecModelKind::kLlmRec;
+  }
+  if (is_llada_rec_model_type(model_type)) {
+    return RecModelKind::kLLaDARec;
   }
   return RecModelKind::kNone;
 }

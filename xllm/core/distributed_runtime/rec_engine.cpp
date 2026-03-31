@@ -718,6 +718,44 @@ RecEngine::RecMultiRoundEnginePipeline::RecMultiRoundEnginePipeline(
     RecEngine& engine)
     : RecEnginePipeline(engine) {}
 
+RecEngine::LLaDARecEnginePipeline::LLaDARecEnginePipeline(RecEngine& engine)
+    : RecEnginePipeline(engine) {}
+
+void RecEngine::LLaDARecEnginePipeline::setup_workers() {}
+
+void RecEngine::LLaDARecEnginePipeline::process_group_test() {}
+
+bool RecEngine::LLaDARecEnginePipeline::init_model_workers(
+    const std::string& model_path) {
+  (void)model_path;
+  LOG(ERROR) << "LLaDA Rec runtime pipeline is not implemented yet";
+  return false;
+}
+
+int64_t RecEngine::LLaDARecEnginePipeline::estimate_min_available_memory() {
+  return 0;
+}
+
+bool RecEngine::LLaDARecEnginePipeline::allocate_kv_cache(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  (void)kv_cache_shape;
+  return true;
+}
+
+ForwardOutput RecEngine::LLaDARecEnginePipeline::step(
+    std::vector<Batch>& batches) {
+  (void)batches;
+  LOG(FATAL) << "LLaDA Rec runtime pipeline is not implemented yet";
+  return {};
+}
+
+std::vector<int64_t>
+RecEngine::LLaDARecEnginePipeline::get_active_activation_memory() const {
+  return {};
+}
+
+size_t RecEngine::LLaDARecEnginePipeline::num_workers() const { return 0; }
+
 void RecEngine::RecMultiRoundEnginePipeline::setup_workers() {
   // RecMultiRound uses local workers, no DistManager setup needed
 }
@@ -949,6 +987,8 @@ std::unique_ptr<RecEngine::RecEnginePipeline> RecEngine::create_pipeline(
       return std::make_unique<RecMultiRoundEnginePipeline>(engine);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecEnginePipeline>(engine);
+    case RecPipelineType::kLLaDARecWorkerLoop:
+      return std::make_unique<LLaDARecEnginePipeline>(engine);
     default:
       LOG(FATAL) << "Unknown RecEngine pipeline type: "
                  << static_cast<int>(type);

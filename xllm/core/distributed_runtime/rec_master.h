@@ -132,6 +132,17 @@ class RecMaster : public Master {
         OutputCallback callback) override;
   };
 
+  class LLaDARecMasterPipeline final : public RecMasterPipeline {
+   public:
+    explicit LLaDARecMasterPipeline(RecMaster& master);
+    std::shared_ptr<Request> generate_request(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback) override;
+  };
+
   // Factory method to create pipeline (can access private classes)
   static std::unique_ptr<RecMasterPipeline> create_pipeline(
       RecPipelineType type,

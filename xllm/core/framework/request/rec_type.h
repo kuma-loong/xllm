@@ -27,6 +27,7 @@ enum class RecType : uint8_t {
   kNone = 0,
   kOneRec = 1,
   kLlmRec = 2,
+  kLLaDARec = 3,
 };
 
 }  // namespace xllm

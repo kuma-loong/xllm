@@ -65,6 +65,9 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
       }
       // Fall through for non-multi-round LlmRec (not yet implemented)
       break;
+    case RecType::kLLaDARec:
+      LOG(FATAL) << "LLaDA Rec batch input builder is not implemented yet";
+      break;
     case RecType::kNone:
       break;
   }
