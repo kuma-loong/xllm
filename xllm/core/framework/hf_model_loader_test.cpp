@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+
 #include "core/common/rec_model_utils.h"
 #include "core/platform/device.h"
 #if defined(USE_NPU)
@@ -24,6 +26,26 @@ limitations under the License.
 #endif
 
 namespace xllm {
+
+namespace {
+
+std::filesystem::path find_llada_model_dir() {
+  auto current = std::filesystem::current_path();
+  for (int i = 0; i < 8; ++i) {
+    auto candidate = current / "models" / "LLaDA2.1-mini";
+    if (std::filesystem::exists(candidate / "config.json") &&
+        std::filesystem::exists(candidate / "tokenizer_config.json")) {
+      return candidate;
+    }
+    if (current == current.root_path()) {
+      break;
+    }
+    current = current.parent_path();
+  }
+  return {};
+}
+
+}  // namespace
 
 TEST(HFModelLoaderTest, LoadCompressedTensorsFp8StaticConfig) {
   JsonReader reader;
@@ -229,26 +251,33 @@ TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
   EXPECT_TRUE(args.stop_token_ids().empty());
 }
 
-TEST(HFModelLoaderTest, LLaDATokenizerArgsLoader) {
-  auto loader = ModelRegistry::get_tokenizer_args_loader("llada2_moe");
-  ASSERT_TRUE(loader != nullptr);
+TEST(HFModelLoaderTest, LLaDARealModelDirectoryLoadsArgsAndTokenizer) {
+  const auto model_dir = find_llada_model_dir();
+  if (model_dir.empty()) {
+    GTEST_SKIP() << "LLaDA2.1-mini local model directory not found";
+  }
 
-  JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
-    {
-      "add_bos_token": false,
-      "add_eos_token": false,
-      "bos_token": "<|startoftext|>",
-      "chat_template": "{% if add_generation_prompt %}<role>ASSISTANT</role>{% endif %}",
-      "eos_token": "<|endoftext|>",
-      "pad_token": "<|endoftext|>",
-      "tokenizer_class": "PreTrainedTokenizerFast"
-    }
-  )json"));
+  HFModelLoader loader(model_dir.string());
 
-  TokenizerArgs args;
-  ASSERT_TRUE(loader(reader, &args));
-  EXPECT_EQ(args.tokenizer_type(), "fast");
+  const ModelArgs& model_args = loader.model_args();
+  EXPECT_EQ(model_args.model_type(), "llada2_moe");
+  EXPECT_EQ(model_args.dtype(), "bfloat16");
+  EXPECT_EQ(model_args.hidden_size(), 2048);
+  EXPECT_EQ(model_args.n_layers(), 20);
+  EXPECT_EQ(model_args.n_heads(), 16);
+  ASSERT_TRUE(model_args.n_kv_heads().has_value());
+  EXPECT_EQ(model_args.n_kv_heads().value(), 4);
+  EXPECT_EQ(model_args.num_experts(), 256);
+  EXPECT_EQ(model_args.num_experts_per_tok(), 8);
+  EXPECT_EQ(model_args.n_shared_experts(), 1);
+  EXPECT_EQ(model_args.scoring_func(), "sigmoid");
+
+  const TokenizerArgs& tokenizer_args = loader.tokenizer_args();
+  EXPECT_EQ(tokenizer_args.tokenizer_type(), "fast");
+  EXPECT_EQ(tokenizer_args.tokenizer_class(), "PreTrainedTokenizerFast");
+  EXPECT_FALSE(tokenizer_args.chat_template().empty());
+  EXPECT_EQ(tokenizer_args.bos_token(), "<|startoftext|>");
+  EXPECT_EQ(tokenizer_args.eos_token(), "<|endoftext|>");
 }
 #endif
 

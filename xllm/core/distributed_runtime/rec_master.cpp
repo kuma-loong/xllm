@@ -498,7 +498,12 @@ RecMaster::RecMaster(const Options& options)
     : Master(options, EngineType::REC) {
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
-  CHECK(engine_->init());
+  if (!engine_->init()) {
+    init_error_message_ = "Failed to initialize rec engine for model_path=" +
+                          options_.model_path();
+    LOG(ERROR) << init_error_message_;
+    return;
+  }
 
   model_args_ = engine_->model_args();
   rec_type_ = get_rec_type(model_args_);
@@ -554,9 +559,17 @@ RecMaster::RecMaster(const Options& options)
     mm_data_pipeline_ =
         create_pipeline(RecPipelineType::kLlmRecWithMmData, *this);
   }
+
+  initialized_ = true;
 }
 
 void RecMaster::run() {
+  if (!initialized_ || scheduler_ == nullptr) {
+    LOG(ERROR) << "RecMaster is not initialized. "
+               << (init_error_message_.empty() ? "Unknown init failure"
+                                               : init_error_message_);
+    return;
+  }
   const bool already_running = running_.load(std::memory_order_relaxed);
   if (already_running) {
     LOG(WARNING) << "RecMaster is already running.";
@@ -590,6 +603,13 @@ void RecMaster::handle_request(
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
     RequestParams sp,
     OutputCallback callback) {
+  if (!initialized_) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        init_error_message_.empty()
+                            ? "Rec backend is not initialized"
+                            : init_error_message_);
+    return;
+  }
   // This interface supports both OneRec and LlmRec (qwen3 without mm_data)
   if (rec_type_ != RecType::kOneRec && rec_type_ != RecType::kLlmRec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
@@ -618,6 +638,13 @@ void RecMaster::handle_request(
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
     RequestParams sp,
     OutputCallback callback) {
+  if (!initialized_) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        init_error_message_.empty()
+                            ? "Rec backend is not initialized"
+                            : init_error_message_);
+    return;
+  }
   if (rec_type_ != RecType::kLlmRec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "Chat is only supported for LLMRec models");
@@ -664,6 +691,13 @@ void RecMaster::handle_request(const std::vector<int>& prompt_tokens,
                                std::optional<MMData> mm_data,
                                RequestParams sp,
                                OutputCallback callback) {
+  if (!initialized_) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        init_error_message_.empty()
+                            ? "Rec backend is not initialized"
+                            : init_error_message_);
+    return;
+  }
   if (rec_type_ != RecType::kLlmRec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "LLMRec should use raw input interface");
