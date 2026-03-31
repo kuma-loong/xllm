@@ -125,6 +125,7 @@ struct ModelArgs {
   PROPERTY(int32_t, n_shared_experts) = 0;
   PROPERTY(int32_t, num_experts_per_tok) = 0;
   PROPERTY(int32_t, moe_intermediate_size) = 0;
+  PROPERTY(bool, moe_router_enable_expert_bias) = false;
   PROPERTY(float, routed_scaling_factor) = 0.0f;
   PROPERTY(bool, norm_topk_prob) = false;
   PROPERTY(int32_t, n_group) = 0;

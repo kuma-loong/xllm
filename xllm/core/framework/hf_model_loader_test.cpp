@@ -198,8 +198,10 @@ TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
       "max_position_embeddings": 32768,
       "model_type": "llada2_moe",
       "moe_intermediate_size": 512,
+      "moe_router_enable_expert_bias": true,
       "n_group": 8,
-      "norm_head": false,
+      "use_qk_norm": true,
+      "use_qkv_bias": false,
       "norm_topk_prob": true,
       "num_attention_heads": 16,
       "num_experts": 256,
@@ -235,7 +237,8 @@ TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
   EXPECT_EQ(args.max_position_embeddings(), 32768);
   EXPECT_FLOAT_EQ(args.rope_theta(), 600000.0f);
   EXPECT_FLOAT_EQ(args.partial_rotary_factor(), 0.5f);
-  EXPECT_FALSE(args.use_qk_norm());
+  EXPECT_TRUE(args.use_qk_norm());
+  EXPECT_TRUE(args.moe_router_enable_expert_bias());
   EXPECT_EQ(args.first_k_dense_replace(), 1);
   EXPECT_EQ(args.num_experts(), 256);
   EXPECT_EQ(args.n_routed_experts(), 256);
@@ -249,6 +252,64 @@ TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
   EXPECT_EQ(args.pad_token_id(), 156892);
   EXPECT_EQ(args.vocab_size(), 157184);
   EXPECT_TRUE(args.stop_token_ids().empty());
+}
+
+TEST(HFModelLoaderTest, LLaDAModelArgsLoaderDefaultsUseQkNorm) {
+  auto loader = ModelRegistry::get_model_args_loader("llada2_moe");
+  ASSERT_TRUE(loader != nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "llada2_moe",
+      "hidden_size": 2048,
+      "intermediate_size": 5120,
+      "num_hidden_layers": 20,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "head_dim": 128,
+      "moe_intermediate_size": 512,
+      "num_experts": 256,
+      "num_experts_per_tok": 8,
+      "num_shared_experts": 1,
+      "n_group": 8,
+      "topk_group": 4,
+      "norm_head": false
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_TRUE(args.use_qk_norm());
+}
+
+TEST(HFModelLoaderTest, LLaDAModelArgsLoaderUsesTorchDtypeFallback) {
+  auto loader = ModelRegistry::get_model_args_loader("llada2_moe");
+  ASSERT_TRUE(loader != nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "llada2_moe",
+      "torch_dtype": "float16",
+      "hidden_size": 2048,
+      "intermediate_size": 5120,
+      "num_hidden_layers": 20,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "head_dim": 128,
+      "moe_intermediate_size": 512,
+      "num_experts": 256,
+      "num_experts_per_tok": 8,
+      "num_shared_experts": 1,
+      "n_group": 8,
+      "topk_group": 4
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.dtype(), "float16");
 }
 
 TEST(HFModelLoaderTest, LLaDARealModelDirectoryLoadsArgsAndTokenizer) {
@@ -270,6 +331,8 @@ TEST(HFModelLoaderTest, LLaDARealModelDirectoryLoadsArgsAndTokenizer) {
   EXPECT_EQ(model_args.num_experts(), 256);
   EXPECT_EQ(model_args.num_experts_per_tok(), 8);
   EXPECT_EQ(model_args.n_shared_experts(), 1);
+  EXPECT_TRUE(model_args.use_qk_norm());
+  EXPECT_TRUE(model_args.moe_router_enable_expert_bias());
   EXPECT_EQ(model_args.scoring_func(), "sigmoid");
 
   const TokenizerArgs& tokenizer_args = loader.tokenizer_args();
