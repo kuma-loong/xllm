@@ -36,6 +36,7 @@ cc_library(
   NAME
     layers
   HDRS
+    llada2_moe_decoder_layer.h
     onerec_block_layer.h
     qwen2_decoder_layer.h
     qwen2_vision_layer.h
@@ -44,6 +45,7 @@ cc_library(
     qwen3_decoder_layer.h
     qwen3_moe_decoder_layer.h
   SRCS
+    llada2_moe_decoder_layer.cpp
     qwen2_vision_layer.cpp
     qwen2_decoder_layer.cpp
     qwen2_5_vision_layer.cpp
