@@ -1477,7 +1477,8 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                        context.get_quant_args(),
                                        context.get_tensor_options());
 
-    if (rec_model_kind_ == RecModelKind::kOneRec) {
+    if (rec_model_kind_ == RecModelKind::kOneRec ||
+        rec_model_kind_ == RecModelKind::kLLaDARec) {
       runtime.model = create_rec_model(*runtime.context.get());
     } else {
       runtime.model = create_llm_model(*runtime.context.get());
@@ -1645,6 +1646,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
   return future;
 }
 
+std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
+    const ForwardInput& input) {
+  (void)input;
+  LOG(ERROR) << "LLaDA Rec worker loop is not implemented yet";
+  return std::nullopt;
+}
+
 // ============================================================
 // RecWorkerImpl pipeline factory (static method)
 // ============================================================
@@ -1659,6 +1667,8 @@ std::unique_ptr<RecWorkerImpl::RecWorkPipeline> RecWorkerImpl::create_pipeline(
       return std::make_unique<OneRecWorkPipeline>(runtime);
     case RecPipelineType::kLlmRecMultiRoundPipeline:
       return std::make_unique<LlmRecMultiRoundPipeline>(runtime);
+    case RecPipelineType::kLLaDARecWorkerLoop:
+      return std::make_unique<LLaDARecWorkPipeline>(runtime);
     default:
       LOG(FATAL) << "Unknown RecWorkerImpl pipeline type: "
                  << static_cast<int>(type);

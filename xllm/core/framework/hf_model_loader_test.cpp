@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include "core/common/rec_model_utils.h"
 #include "core/platform/device.h"
 #if defined(USE_NPU)
 #include "models/model_registry.h"
@@ -122,6 +123,132 @@ TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromMoeConfig) {
   ASSERT_EQ(args.layer_types().size(), 2);
   EXPECT_EQ(args.layer_types()[0], "full_attention");
   EXPECT_EQ(args.layer_types()[1], "full_attention");
+}
+
+TEST(HFModelLoaderTest, LLaDAResolveModelRegistration) {
+  std::string effective_backend;
+  std::string resolved_name;
+  std::string error_message;
+
+  ASSERT_TRUE(resolve_model_registration("llada2_moe",
+                                         "AUTO",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "llada2_moe");
+
+  ASSERT_TRUE(resolve_model_registration("llada2_moe",
+                                         "TORCH",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "llada2_moe");
+
+  EXPECT_FALSE(resolve_model_registration(
+      "llada2_moe", "ATB", &effective_backend, &resolved_name, &error_message));
+  EXPECT_NE(error_message.find("only supports --npu_kernel_backend=TORCH"),
+            std::string::npos);
+}
+
+TEST(HFModelLoaderTest, LLaDARecModelKindAndPipelineType) {
+  EXPECT_EQ(get_rec_model_kind("llada2_moe"), RecModelKind::kLLaDARec);
+  EXPECT_EQ(get_rec_pipeline_type(RecModelKind::kLLaDARec),
+            RecPipelineType::kLLaDARecWorkerLoop);
+  EXPECT_EQ(ModelRegistry::get_model_backend("llada2_moe"), "rec");
+}
+
+TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
+  auto loader = ModelRegistry::get_model_args_loader("llada2_moe");
+  ASSERT_TRUE(loader != nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "dtype": "bfloat16",
+      "first_k_dense_replace": 1,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 2048,
+      "initializer_range": 0.02,
+      "intermediate_size": 5120,
+      "max_position_embeddings": 32768,
+      "model_type": "llada2_moe",
+      "moe_intermediate_size": 512,
+      "n_group": 8,
+      "norm_head": false,
+      "norm_topk_prob": true,
+      "num_attention_heads": 16,
+      "num_experts": 256,
+      "num_experts_per_tok": 8,
+      "num_hidden_layers": 20,
+      "num_key_value_heads": 4,
+      "num_shared_experts": 1,
+      "output_router_logits": false,
+      "pad_token_id": 156892,
+      "partial_rotary_factor": 0.5,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 600000,
+      "routed_scaling_factor": 2.5,
+      "score_function": "sigmoid",
+      "tie_word_embeddings": false,
+      "topk_group": 4,
+      "vocab_size": 157184
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.model_type(), "llada2_moe");
+  EXPECT_EQ(args.dtype(), "bfloat16");
+  EXPECT_EQ(args.hidden_size(), 2048);
+  EXPECT_EQ(args.intermediate_size(), 5120);
+  EXPECT_EQ(args.n_layers(), 20);
+  EXPECT_EQ(args.n_heads(), 16);
+  ASSERT_TRUE(args.n_kv_heads().has_value());
+  EXPECT_EQ(args.n_kv_heads().value(), 4);
+  EXPECT_EQ(args.head_dim(), 128);
+  EXPECT_FLOAT_EQ(args.rms_norm_eps(), 1e-6f);
+  EXPECT_EQ(args.max_position_embeddings(), 32768);
+  EXPECT_FLOAT_EQ(args.rope_theta(), 600000.0f);
+  EXPECT_FLOAT_EQ(args.partial_rotary_factor(), 0.5f);
+  EXPECT_FALSE(args.use_qk_norm());
+  EXPECT_EQ(args.first_k_dense_replace(), 1);
+  EXPECT_EQ(args.num_experts(), 256);
+  EXPECT_EQ(args.n_routed_experts(), 256);
+  EXPECT_EQ(args.num_experts_per_tok(), 8);
+  EXPECT_EQ(args.n_shared_experts(), 1);
+  EXPECT_EQ(args.moe_intermediate_size(), 512);
+  EXPECT_EQ(args.n_group(), 8);
+  EXPECT_EQ(args.topk_group(), 4);
+  EXPECT_FLOAT_EQ(args.routed_scaling_factor(), 2.5f);
+  EXPECT_EQ(args.scoring_func(), "sigmoid");
+  EXPECT_EQ(args.pad_token_id(), 156892);
+  EXPECT_EQ(args.vocab_size(), 157184);
+  EXPECT_TRUE(args.stop_token_ids().empty());
+}
+
+TEST(HFModelLoaderTest, LLaDATokenizerArgsLoader) {
+  auto loader = ModelRegistry::get_tokenizer_args_loader("llada2_moe");
+  ASSERT_TRUE(loader != nullptr);
+
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "add_bos_token": false,
+      "add_eos_token": false,
+      "bos_token": "<|startoftext|>",
+      "chat_template": "{% if add_generation_prompt %}<role>ASSISTANT</role>{% endif %}",
+      "eos_token": "<|endoftext|>",
+      "pad_token": "<|endoftext|>",
+      "tokenizer_class": "PreTrainedTokenizerFast"
+    }
+  )json"));
+
+  TokenizerArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.tokenizer_type(), "fast");
 }
 #endif
 

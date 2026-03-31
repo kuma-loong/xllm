@@ -276,6 +276,14 @@ class RecWorkerImpl : public LLMWorkerImpl {
     int32_t beam_width_;
   };
 
+  class LLaDARecWorkPipeline final : public RecWorkPipeline {
+   public:
+    explicit LLaDARecWorkPipeline(RecPipelineRuntime& runtime)
+        : RecWorkPipeline(runtime) {}
+
+    std::optional<ForwardOutput> step(const ForwardInput& input) override;
+  };
+
   // Factory method to create pipeline (can access private classes)
   static std::unique_ptr<RecWorkPipeline> create_pipeline(
       RecPipelineType type,

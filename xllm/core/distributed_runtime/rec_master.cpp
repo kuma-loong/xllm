@@ -64,6 +64,8 @@ RecType get_rec_type(const ModelArgs& model_args) {
       return RecType::kOneRec;
     case RecModelKind::kLlmRec:
       return RecType::kLlmRec;
+    case RecModelKind::kLLaDARec:
+      return RecType::kLLaDARec;
     case RecModelKind::kNone:
       return RecType::kNone;
   }
@@ -451,6 +453,24 @@ std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
                                       /*build_stop_checker=*/false);
 }
 
+RecMaster::LLaDARecMasterPipeline::LLaDARecMasterPipeline(RecMaster& master)
+    : RecMasterPipeline(master) {}
+
+std::shared_ptr<Request> RecMaster::LLaDARecMasterPipeline::generate_request(
+    std::string prompt,
+    std::optional<std::vector<int>> prompt_tokens,
+    std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+    const RequestParams& sp,
+    OutputCallback callback) {
+  (void)prompt;
+  (void)prompt_tokens;
+  (void)input_tensors;
+  (void)sp;
+  CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                      "LLaDA Rec request handling is not implemented yet");
+  return nullptr;
+}
+
 // ============================================================
 // RecMaster pipeline factory (static method)
 // ============================================================
@@ -465,6 +485,8 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
       return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecMasterPipeline>(master);
+    case RecPipelineType::kLLaDARecWorkerLoop:
+      return std::make_unique<LLaDARecMasterPipeline>(master);
     default:
       LOG(FATAL) << "Unknown RecMaster pipeline type: "
                  << static_cast<int>(type);
