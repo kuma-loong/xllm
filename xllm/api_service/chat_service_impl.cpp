@@ -515,9 +515,11 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
 
-  if (rec_master_->rec_type() != RecType::kLlmRec) {
-    call->finish_with_error(StatusCode::INVALID_ARGUMENT,
-                            "Chat is only supported for LLMRec models");
+  if (rec_master_->rec_type() != RecType::kLlmRec &&
+      rec_master_->rec_type() != RecType::kLLaDARec) {
+    call->finish_with_error(
+        StatusCode::INVALID_ARGUMENT,
+        "Chat is only supported for LLMRec/LLaDARec models");
     return;
   }
 
