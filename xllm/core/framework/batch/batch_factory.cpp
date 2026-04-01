@@ -115,7 +115,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     num_prompt_tokens += prompt_tokens;
     num_generated_tokens += generated_tokens;
 
-    batches[sequence->dp_rank()].set_batch_id();
+    batches[sequence->dp_rank()].add(sequence, token_budget);
   }
 
   for (const auto& request : running_requests) {

@@ -256,8 +256,20 @@ struct LlmRecMultiRoundParams {
   }
 };
 
-using RecModelInputParams = std::
-    variant<std::monostate, OneRecModelInputParams, LlmRecMultiRoundParams>;
+struct LLaDARecParams {
+  int32_t prompt_length = 0;
+  int32_t max_generated_tokens = 0;
+
+  LLaDARecParams to(const torch::Device& device) const {
+    (void)device;
+    return *this;
+  }
+};
+
+using RecModelInputParams = std::variant<std::monostate,
+                                         OneRecModelInputParams,
+                                         LlmRecMultiRoundParams,
+                                         LLaDARecParams>;
 
 enum class TransferType : uint8_t {
   G2H = 0,  // global memory(KVCache store) to host memory(DRAM)
@@ -419,6 +431,8 @@ struct ModelInputParams {
       params.rec_params = onerec->to(device);
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
+    } else if (const auto* llada = llada_params()) {
+      params.rec_params = llada->to(device);
     }
 
     params.cp_prefill_inputs = cp_prefill_inputs.to(device);
@@ -450,6 +464,10 @@ struct ModelInputParams {
       LOG(INFO) << "ModelInputParams: has llm_rec_multi_round_params"
                 << ", beam_width=" << llmrec->beam_width
                 << ", total_round=" << llmrec->total_round;
+    } else if (const auto* llada = llada_params()) {
+      LOG(INFO) << "ModelInputParams: has llada_rec_params"
+                << ", prompt_length=" << llada->prompt_length
+                << ", max_generated_tokens=" << llada->max_generated_tokens;
     }
   }
 
@@ -610,6 +628,19 @@ struct ModelInputParams {
       rec_params.emplace<LlmRecMultiRoundParams>();
     }
     return std::get<LlmRecMultiRoundParams>(rec_params);
+  }
+
+  const LLaDARecParams* llada_params() const {
+    return std::get_if<LLaDARecParams>(&rec_params);
+  }
+
+  bool has_llada_params() const { return llada_params() != nullptr; }
+
+  LLaDARecParams& mutable_llada_params() {
+    if (!has_llada_params()) {
+      rec_params.emplace<LLaDARecParams>();
+    }
+    return std::get<LLaDARecParams>(rec_params);
   }
 
   struct GraphBuffer {

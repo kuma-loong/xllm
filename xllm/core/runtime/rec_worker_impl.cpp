@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1646,11 +1647,292 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
   return future;
 }
 
+ForwardInput RecWorkerImpl::LLaDARecWorkPipeline::prepare_inputs(Batch& batch) {
+  ThreadPool* thread_pool =
+      runtime_.worker.input_builder_thread_pool_
+          ? runtime_.worker.input_builder_thread_pool_.get()
+          : nullptr;
+  return batch.prepare_rec_forward_input(
+      runtime_.worker.options_.num_decoding_tokens(),
+      /*min_decoding_batch_size=*/0,
+      runtime_.context->get_model_args(),
+      thread_pool);
+}
+
+torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
+    const torch::Tensor& logits,
+    const SamplingParameters& sampling_params) {
+  torch::Tensor filtered_logits = logits;
+  float temperature = 0.0f;
+  if (sampling_params.temperatures.defined() &&
+      sampling_params.temperatures.numel() > 0) {
+    temperature = sampling_params.temperatures[0].item<float>();
+  }
+  if (temperature > 0.0f) {
+    filtered_logits = filtered_logits / temperature;
+  }
+
+  int64_t top_k = -1;
+  if (sampling_params.top_k.defined() && sampling_params.top_k.numel() > 0) {
+    top_k = sampling_params.top_k[0].item<int64_t>();
+  }
+  if (top_k > 0 && top_k < filtered_logits.size(-1)) {
+    auto topk = std::get<0>(filtered_logits.topk(top_k, -1));
+    auto kth = topk.select(-1, top_k - 1).unsqueeze(-1);
+    filtered_logits = filtered_logits.masked_fill(
+        filtered_logits < kth, -std::numeric_limits<float>::infinity());
+  }
+
+  float top_p = 1.0f;
+  if (sampling_params.top_p.defined() && sampling_params.top_p.numel() > 0) {
+    top_p = sampling_params.top_p[0].item<float>();
+  }
+  if (top_p < 1.0f) {
+    auto sorted = torch::sort(filtered_logits, -1, /*descending=*/true);
+    auto sorted_logits = std::get<0>(sorted);
+    auto sorted_indices = std::get<1>(sorted);
+    auto probs = torch::softmax(sorted_logits, -1);
+    auto cumulative_probs = torch::cumsum(probs, -1);
+    auto sorted_mask = cumulative_probs > top_p;
+    if (sorted_mask.size(-1) > 1) {
+      auto shifted_mask = torch::zeros_like(sorted_mask);
+      shifted_mask.slice(-1, 1, sorted_mask.size(-1))
+          .copy_(sorted_mask.slice(-1, 0, sorted_mask.size(-1) - 1));
+      sorted_mask = shifted_mask;
+    }
+    auto remove_mask = torch::zeros_like(sorted_mask);
+    remove_mask.scatter_(-1, sorted_indices, sorted_mask);
+    filtered_logits = filtered_logits.masked_fill(
+        remove_mask, -std::numeric_limits<float>::infinity());
+  }
+
+  auto do_sample = sampling_params.do_sample.defined() &&
+                   sampling_params.do_sample.numel() > 0 &&
+                   sampling_params.do_sample[0].item<bool>();
+  if (!do_sample && temperature <= 0.0f && top_k <= 0 && top_p >= 1.0f) {
+    return std::get<1>(filtered_logits.max(-1, true));
+  }
+
+  auto probs = torch::softmax(filtered_logits, -1);
+  return torch::multinomial(probs.view({-1, probs.size(-1)}), 1)
+      .view({logits.size(0), logits.size(1)});
+}
+
 std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
     const ForwardInput& input) {
-  (void)input;
-  LOG(ERROR) << "LLaDA Rec worker loop is not implemented yet";
-  return std::nullopt;
+  runtime_.worker.device_.set_device();
+  const auto* llada_params = input.input_params.llada_params();
+  CHECK(llada_params != nullptr) << "LLaDA worker requires llada_params.";
+
+  const int32_t prompt_length = llada_params->prompt_length;
+  const int32_t gen_length = llada_params->max_generated_tokens;
+  CHECK_GT(prompt_length, 0);
+  CHECK_GT(gen_length, 0);
+
+  auto device = runtime_.worker.device();
+  auto token_options =
+      torch::TensorOptions().device(device).dtype(torch::kInt32);
+  auto bool_options = torch::TensorOptions().device(device).dtype(torch::kBool);
+
+  const int32_t effective_steps =
+      std::min(FLAGS_llada_steps,
+               std::max(gen_length / std::max(FLAGS_llada_minimal_topk, 1), 1));
+  const int32_t block_length = std::max(FLAGS_llada_block_length, 1);
+  const int32_t num_blocks =
+      (prompt_length + gen_length + block_length - 1) / block_length;
+  const int32_t total_length = num_blocks * block_length;
+
+  torch::Tensor prompt = input.token_ids.view({1, -1}).to(token_options);
+  torch::Tensor x =
+      torch::full({1, total_length}, FLAGS_llada_mask_id, token_options);
+  x.slice(/*dim=*/1, 0, prompt_length).copy_(prompt);
+  torch::Tensor position_ids =
+      torch::arange(total_length, token_options).view({1, total_length});
+
+  torch::Tensor block_mask = torch::tril(torch::ones(
+      {num_blocks, num_blocks},
+      torch::TensorOptions().device(device).dtype(torch::kFloat32)));
+  torch::Tensor attention_mask = block_mask.repeat_interleave(block_length, 0)
+                                     .repeat_interleave(block_length, 1)
+                                     .unsqueeze(0)
+                                     .unsqueeze(0);
+  attention_mask = (torch::ones_like(attention_mask) - attention_mask) * -1e9;
+
+  const int32_t prefill_blocks = prompt_length / block_length;
+  bool eos_early_stopped = false;
+
+  for (int32_t num_block = prefill_blocks; num_block < num_blocks;
+       ++num_block) {
+    const int32_t current_window_end = (num_block + 1) * block_length;
+    torch::Tensor cur_x = x.slice(1, 0, current_window_end).clone();
+    torch::Tensor cur_positions =
+        position_ids.slice(1, 0, current_window_end).reshape({-1});
+    torch::Tensor cur_attn_mask = attention_mask.slice(2, 0, current_window_end)
+                                      .slice(3, 0, current_window_end);
+    const int32_t block_start_pos = num_block * block_length;
+
+    int32_t post_steps = 0;
+    int32_t refine_steps = 0;
+    while (true) {
+      ++refine_steps;
+      torch::Tensor old_block_tokens =
+          cur_x.slice(1, current_window_end - block_length, current_window_end)
+              .clone();
+      torch::Tensor active_block_mask =
+          old_block_tokens.eq(FLAGS_llada_mask_id);
+      if (!active_block_mask.any().item<bool>()) {
+        ++post_steps;
+      }
+      if (post_steps > FLAGS_llada_max_post_steps) {
+        break;
+      }
+      if (refine_steps > effective_steps + FLAGS_llada_max_post_steps) {
+        LOG(WARNING) << "LLaDA block refinement reached step cap"
+                     << ", rank="
+                     << runtime_.context->get_parallel_args().rank()
+                     << ", block=" << num_block
+                     << ", refine_steps=" << refine_steps;
+        break;
+      }
+
+      torch::Tensor prompt_mask_in_block =
+          torch::zeros({block_length}, bool_options);
+      if (block_start_pos < prompt_length) {
+        const int32_t prompt_end_in_block =
+            std::min(prompt_length - block_start_pos, block_length);
+        prompt_mask_in_block.slice(0, 0, prompt_end_in_block).fill_(true);
+      }
+
+      ModelInputParams model_input_params;
+      model_input_params.graph_buffer.attn_mask = cur_attn_mask;
+      auto model_output = runtime_.model->forward(cur_x.reshape({-1}),
+                                                  cur_positions,
+                                                  runtime_.worker.kv_caches_,
+                                                  model_input_params);
+      torch::Tensor logits =
+          runtime_.model->logits(model_output.hidden_states, torch::Tensor());
+      torch::Tensor active_logits =
+          logits.view({1, current_window_end, -1})
+              .slice(1, current_window_end - block_length, current_window_end);
+      torch::Tensor next_tokens =
+          sample_next_tokens(active_logits, input.sampling_params)
+              .to(token_options);
+      torch::Tensor next_probs =
+          torch::softmax(active_logits, -1)
+              .gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1))
+              .squeeze(-1);
+
+      torch::Tensor mask_transfer_index =
+          torch::zeros_like(next_tokens, bool_options);
+      if (active_block_mask.any().item<bool>()) {
+        torch::Tensor mask_confidence = torch::where(
+            active_block_mask,
+            next_probs,
+            torch::full_like(next_probs,
+                             -std::numeric_limits<float>::infinity()));
+        torch::Tensor high_conf_mask = mask_confidence.gt(FLAGS_llada_threshold)
+                                           .logical_and(active_block_mask);
+        const int64_t num_high_confidence =
+            high_conf_mask.sum().item<int64_t>();
+        if (num_high_confidence >= FLAGS_llada_num_to_transfer) {
+          mask_transfer_index = high_conf_mask;
+        } else {
+          const int64_t num_available = active_block_mask.sum().item<int64_t>();
+          if (num_available > 0) {
+            auto topk_indices = std::get<1>(mask_confidence.topk(
+                std::min<int64_t>(FLAGS_llada_num_to_transfer, num_available),
+                -1));
+            mask_transfer_index.scatter_(1, topk_indices, true);
+            mask_transfer_index =
+                mask_transfer_index.logical_and(active_block_mask);
+          }
+        }
+      }
+
+      torch::Tensor editable_positions =
+          active_block_mask.logical_not().logical_and(
+              prompt_mask_in_block.unsqueeze(0).logical_not());
+      torch::Tensor editing_confidence = torch::where(
+          editable_positions,
+          next_probs,
+          torch::full_like(next_probs,
+                           -std::numeric_limits<float>::infinity()));
+      torch::Tensor editing_transfer_index =
+          editing_confidence.gt(FLAGS_llada_editing_threshold)
+              .logical_and(editable_positions)
+              .logical_and(next_tokens.ne(old_block_tokens));
+      torch::Tensor final_transfer_index =
+          mask_transfer_index.logical_or(editing_transfer_index);
+
+      if (final_transfer_index.any().item<bool>()) {
+        auto block_slice = cur_x.slice(
+            1, current_window_end - block_length, current_window_end);
+        block_slice.masked_scatter_(
+            final_transfer_index,
+            next_tokens.masked_select(final_transfer_index));
+      }
+
+      if (!active_block_mask.any().item<bool>() &&
+          !editing_transfer_index.any().item<bool>()) {
+        break;
+      }
+    }
+
+    x.slice(1, 0, current_window_end).copy_(cur_x);
+    if (FLAGS_llada_eos_early_stop) {
+      torch::Tensor generated_part =
+          x.slice(1, prompt_length, current_window_end);
+      if (!generated_part.eq(FLAGS_llada_mask_id).any().item<bool>()) {
+        torch::Tensor eos_hits = generated_part.eq(
+            runtime_.context->get_model_args().eos_token_id());
+        if (eos_hits.any().item<bool>()) {
+          eos_early_stopped = true;
+          break;
+        }
+      }
+    }
+  }
+
+  torch::Tensor generated_answer = x.slice(1, 0, prompt_length + gen_length);
+  torch::Tensor generated_tokens =
+      generated_answer.slice(1, prompt_length, prompt_length + gen_length);
+  torch::Tensor eos_positions =
+      generated_tokens.eq(runtime_.context->get_model_args().eos_token_id())
+          .nonzero();
+  int64_t answer_length = gen_length;
+  if (eos_positions.numel() > 0) {
+    answer_length = eos_positions[0][1].item<int64_t>() + 1;
+  }
+  generated_tokens =
+      generated_tokens.slice(1, 0, answer_length).to(torch::kCPU);
+
+  CHECK(!generated_tokens.eq(FLAGS_llada_mask_id).any().item<bool>())
+      << "LLaDA generation ended with unresolved mask tokens.";
+
+  RawForwardOutput raw_output;
+  RawSampleOutput sample;
+  auto accessor = generated_tokens.accessor<int, 2>();
+  sample.tokens.reserve(answer_length);
+  for (int64_t i = 0; i < answer_length; ++i) {
+    RawToken token;
+    token.id = accessor[0][i];
+    sample.tokens.push_back(std::move(token));
+  }
+  raw_output.outputs.push_back(std::move(sample));
+
+  LOG(INFO) << "LLaDA worker finished generation"
+            << ", rank=" << runtime_.context->get_parallel_args().rank()
+            << ", device=" << runtime_.worker.device().index()
+            << ", prompt_tokens=" << prompt_length
+            << ", max_tokens=" << gen_length
+            << ", block_length=" << block_length
+            << ", steps=" << effective_steps
+            << ", generated_tokens=" << answer_length
+            << ", eos_early_stop=" << eos_early_stopped;
+
+  ForwardOutput output;
+  output.raw_output = std::move(raw_output);
+  return output;
 }
 
 // ============================================================

@@ -163,7 +163,11 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
   RecType rec_type = RecType::kNone;
   if (!sequence_groups_.empty() && !sequence_groups_[0]->sequences().empty()) {
     rec_type = sequence_groups_[0]->sequences()[0]->rec_type();
+  } else if (!sequences_.empty()) {
+    rec_type = sequences_[0]->rec_type();
   }
+
+  refresh_output_targets();
 
   auto builder = RecBatchInputBuilder::create(rec_type,
                                               sequence_groups_,

@@ -281,7 +281,12 @@ class RecWorkerImpl : public LLMWorkerImpl {
     explicit LLaDARecWorkPipeline(RecPipelineRuntime& runtime)
         : RecWorkPipeline(runtime) {}
 
+    ForwardInput prepare_inputs(Batch& batch) override;
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
+
+   private:
+    torch::Tensor sample_next_tokens(const torch::Tensor& logits,
+                                     const SamplingParameters& sampling_params);
   };
 
   // Factory method to create pipeline (can access private classes)

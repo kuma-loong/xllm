@@ -636,6 +636,33 @@ DEFINE_uint32(rec_worker_max_concurrency,
               "Concurrency for rec worker parallel execution. Less than or "
               "equal to 1 means disable concurrent rec worker.");
 
+DEFINE_int32(llada_block_length,
+             32,
+             "Block length for LLaDA worker-driven generation.");
+DEFINE_int32(llada_steps, 32, "Refinement steps for each LLaDA block.");
+DEFINE_double(llada_threshold,
+              0.7,
+              "Confidence threshold for transferring masked LLaDA tokens.");
+DEFINE_double(
+    llada_editing_threshold,
+    0.5,
+    "Confidence threshold for editing non-mask tokens in LLaDA generation.");
+DEFINE_int32(llada_max_post_steps,
+             16,
+             "Maximum post-edit refinement rounds for one LLaDA block.");
+DEFINE_int32(llada_minimal_topk,
+             1,
+             "Minimal top-k divisor used to clamp effective LLaDA steps.");
+DEFINE_int32(llada_num_to_transfer,
+             1,
+             "Minimum number of tokens transferred per LLaDA refinement step.");
+DEFINE_bool(llada_eos_early_stop,
+            true,
+            "Whether LLaDA generation stops early once EOS is resolved.");
+DEFINE_int32(llada_mask_id,
+             156895,
+             "Mask token id used by the LLaDA generation template.");
+
 #if defined(USE_NPU)
 DEFINE_string(npu_kernel_backend,
               "AUTO",
