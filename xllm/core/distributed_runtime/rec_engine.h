@@ -160,6 +160,9 @@ class RecEngine : public Engine {
     ForwardOutput step(std::vector<Batch>& batches) override;
     std::vector<int64_t> get_active_activation_memory() const override;
     size_t num_workers() const override;
+
+   private:
+    ForwardOutput get_model_output(const ForwardInput& model_inputs);
   };
 
   // Factory method to create pipeline (can access private classes)

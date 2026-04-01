@@ -183,28 +183,6 @@ struct ForwardInput {
   torch::Tensor device_input_buffer;
 };
 
-// output after forward execution
-struct ForwardOutput {
-  // sample parameters for speculative decoding
-  torch::Tensor do_sample;
-  // whether to return logprobs
-  bool logprobs = false;
-  // max number of top logprobs in the batch
-  int64_t max_top_logprobs = 0;
-  SampleOutput sample_output;
-  torch::Tensor logits;
-  torch::Tensor embedding;
-
-  // for eplb, collect the tokens load of experts on each worker.
-  torch::Tensor expert_load_data;
-  // for eplb, indicates that the specified layer on the worker
-  // has completed the asynchronous loading of new weight.
-  int32_t prepared_layer_id;
-
-  BeamSearchOutput beam_search_output;
-  torch::Tensor beam_sequence_group;
-};
-
 // Model input with raw data, which will be
 // serielize to pb type before pass to remote worker.
 struct RawForwardInput {
@@ -505,6 +483,32 @@ struct RawForwardOutput {
   std::vector<int32_t> beam_sequence_group;  // flattened 2D
   // multimodal embedding output
   std::vector<torch::Tensor> mm_embeddings;
+};
+
+// output after forward execution
+struct ForwardOutput {
+  // sample parameters for speculative decoding
+  torch::Tensor do_sample;
+  // whether to return logprobs
+  bool logprobs = false;
+  // max number of top logprobs in the batch
+  int64_t max_top_logprobs = 0;
+  SampleOutput sample_output;
+  torch::Tensor logits;
+  torch::Tensor embedding;
+
+  // for eplb, collect the tokens load of experts on each worker.
+  torch::Tensor expert_load_data;
+  // for eplb, indicates that the specified layer on the worker
+  // has completed the asynchronous loading of new weight.
+  int32_t prepared_layer_id = -1;
+
+  BeamSearchOutput beam_search_output;
+  torch::Tensor beam_sequence_group;
+
+  // Local-worker rec paths can return multi-token outputs through the same
+  // RawForwardOutput contract used by remote workers.
+  std::optional<RawForwardOutput> raw_output;
 };
 
 struct BatchedForwardInputs {

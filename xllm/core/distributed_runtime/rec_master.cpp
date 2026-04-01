@@ -72,6 +72,88 @@ RecType get_rec_type(const ModelArgs& model_args) {
   return RecType::kNone;
 }
 
+bool validate_llada_runtime_options(const Options& options,
+                                    std::string* error_message) {
+  if (options.enable_chunked_prefill()) {
+    *error_message = "LLaDA does not support chunked prefill";
+    return false;
+  }
+  if (options.enable_prefix_cache()) {
+    *error_message = "LLaDA does not support prefix cache";
+    return false;
+  }
+  if (options.enable_schedule_overlap()) {
+    *error_message = "LLaDA does not support schedule overlap";
+    return false;
+  }
+  if (options.enable_disagg_pd() || options.enable_service_routing()) {
+    *error_message = "LLaDA does not support PD/service routing modes";
+    return false;
+  }
+  if (options.num_speculative_tokens() > 0) {
+    *error_message = "LLaDA does not support speculative decode";
+    return false;
+  }
+  if (options.max_seqs_per_batch() != 1) {
+    *error_message = "LLaDA requires max_seqs_per_batch=1";
+    return false;
+  }
+  if (options.rec_worker_max_concurrency() != 1) {
+    *error_message = "LLaDA requires rec_worker_max_concurrency=1";
+    return false;
+  }
+  if (options.dp_size() != 1 || options.cp_size() != 1 ||
+      options.ep_size() != 1) {
+    *error_message = "LLaDA v1 only supports TP-only parallelism";
+    return false;
+  }
+  return true;
+}
+
+bool validate_llada_request(
+    const RequestParams& sp,
+    const std::optional<std::vector<proto::InferInputTensor>>& input_tensors,
+    OutputCallback callback) {
+  if (sp.streaming) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA does not support streaming responses");
+    return false;
+  }
+  if (sp.beam_width > 1) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA does not support beam search");
+    return false;
+  }
+  if (sp.best_of.value_or(sp.n) != sp.n) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA requires best_of to equal n");
+    return false;
+  }
+  if (sp.logprobs || sp.top_logprobs > 0) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA does not support logprobs");
+    return false;
+  }
+  if (sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f ||
+      sp.repetition_penalty != 1.0f) {
+    CALLBACK_WITH_ERROR(
+        StatusCode::INVALID_ARGUMENT,
+        "LLaDA does not support repetition or presence penalties");
+    return false;
+  }
+  if (sp.n != 1) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA v1 only supports n=1");
+    return false;
+  }
+  if (input_tensors.has_value() && !input_tensors->empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA does not support input_tensors");
+    return false;
+  }
+  return true;
+}
+
 bool process_onerec_inputs(
     const std::optional<std::vector<int>>& prompt_tokens,
     const std::optional<std::vector<proto::InferInputTensor>>& input_tensors,
@@ -462,13 +544,45 @@ std::shared_ptr<Request> RecMaster::LLaDARecMasterPipeline::generate_request(
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
     const RequestParams& sp,
     OutputCallback callback) {
-  (void)prompt;
-  (void)prompt_tokens;
-  (void)input_tensors;
-  (void)sp;
-  CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                      "LLaDA Rec request handling is not implemented yet");
-  return nullptr;
+  Timer timer;
+  if (!validate_llada_request(sp, input_tensors, callback)) {
+    return nullptr;
+  }
+
+  std::vector<int32_t> local_prompt_tokens;
+  MMData processed_mm_data;
+
+  if (prompt_tokens.has_value()) {
+    local_prompt_tokens.assign(prompt_tokens->begin(), prompt_tokens->end());
+  } else if (!prompt.empty()) {
+    if (!master_.tokenizer_) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Tokenizer is required for LLaDA prompt input");
+      return nullptr;
+    }
+    std::vector<int> tmp_tokens;
+    if (!master_.tokenizer_->encode(
+            prompt, &tmp_tokens, sp.add_special_tokens)) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Failed to tokenize LLaDA prompt");
+      return nullptr;
+    }
+    local_prompt_tokens.assign(tmp_tokens.begin(), tmp_tokens.end());
+  }
+
+  if (local_prompt_tokens.empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA requires prompt or prompt_tokens");
+    return nullptr;
+  }
+
+  COUNTER_ADD(tokenization_latency_seconds, timer.elapsed_seconds());
+  return master_.build_request_common(std::move(prompt),
+                                      std::move(local_prompt_tokens),
+                                      std::move(processed_mm_data),
+                                      sp,
+                                      callback,
+                                      /*build_stop_checker=*/true);
 }
 
 // ============================================================
@@ -509,6 +623,11 @@ RecMaster::RecMaster(const Options& options)
   rec_type_ = get_rec_type(model_args_);
   if (rec_type_ == RecType::kNone) {
     LOG(ERROR) << "Unsupported rec model_type: " << model_args_.model_type();
+  }
+  if (rec_type_ == RecType::kLLaDARec &&
+      !validate_llada_runtime_options(options_, &init_error_message_)) {
+    LOG(ERROR) << init_error_message_;
+    return;
   }
 
   if (options_.enable_service_routing()) {
@@ -611,7 +730,8 @@ void RecMaster::handle_request(
     return;
   }
   // This interface supports both OneRec and LlmRec (qwen3 without mm_data)
-  if (rec_type_ != RecType::kOneRec && rec_type_ != RecType::kLlmRec) {
+  if (rec_type_ != RecType::kOneRec && rec_type_ != RecType::kLlmRec &&
+      rec_type_ != RecType::kLLaDARec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "Unsupported rec type for this interface");
     return;
