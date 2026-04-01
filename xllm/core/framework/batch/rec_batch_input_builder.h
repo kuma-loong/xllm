@@ -24,6 +24,7 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/request/mm_data.h"
 #include "framework/request/rec_type.h"
+#include "framework/request/sequence.h"
 #include "framework/request/sequences_group.h"
 #include "runtime/forward_params.h"
 #include "util/threadpool.h"
@@ -40,6 +41,7 @@ class RecBatchInputBuilder {
 
   static std::unique_ptr<RecBatchInputBuilder> create(
       RecType rec_type,
+      const std::vector<Sequence*>& sequences,
       const std::vector<SequencesGroup*>& sequence_groups,
       const std::vector<uint32_t>& allowed_max_tokens,
       const std::vector<torch::Tensor>& input_embeddings_vec,

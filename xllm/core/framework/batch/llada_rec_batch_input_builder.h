@@ -32,6 +32,7 @@ namespace xllm {
 class LLaDARecBatchInputBuilder : public RecBatchInputBuilder {
  public:
   explicit LLaDARecBatchInputBuilder(
+      const std::vector<Sequence*>& sequences,
       const std::vector<SequencesGroup*>& sequence_groups,
       const std::vector<uint32_t>& allowed_max_tokens,
       const std::vector<torch::Tensor>& input_embeddings_vec,

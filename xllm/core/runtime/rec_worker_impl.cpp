@@ -1659,6 +1659,82 @@ ForwardInput RecWorkerImpl::LLaDARecWorkPipeline::prepare_inputs(Batch& batch) {
       thread_pool);
 }
 
+torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::build_attention_mask(
+    int32_t active_length,
+    int32_t block_length) const {
+  const int32_t num_active_blocks =
+      (active_length + block_length - 1) / block_length;
+  const torch::Device device = runtime_.worker.device();
+  torch::Tensor block_mask = torch::tril(torch::ones(
+      {num_active_blocks, num_active_blocks},
+      torch::TensorOptions().device(device).dtype(torch::kFloat32)));
+  torch::Tensor attention_mask = block_mask.repeat_interleave(block_length, 0)
+                                     .repeat_interleave(block_length, 1)
+                                     .slice(0, 0, active_length)
+                                     .slice(1, 0, active_length)
+                                     .unsqueeze(0)
+                                     .unsqueeze(0);
+  return (torch::ones_like(attention_mask) - attention_mask) * -1e9;
+}
+
+torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::initialize_tokens(
+    const ForwardInput& input,
+    int32_t prompt_length,
+    int32_t total_length) const {
+  const torch::Device device = runtime_.worker.device();
+  const auto token_options =
+      torch::TensorOptions().device(device).dtype(torch::kInt32);
+  torch::Tensor prompt = input.token_ids.view({1, -1}).to(token_options);
+  torch::Tensor tokens =
+      torch::full({1, total_length}, FLAGS_llada_mask_id, token_options);
+  tokens.slice(/*dim=*/1, 0, prompt_length).copy_(prompt);
+  return tokens;
+}
+
+int64_t RecWorkerImpl::LLaDARecWorkPipeline::finalize_answer_length(
+    const torch::Tensor& generated_tokens,
+    int32_t eos_token_id,
+    int32_t mask_token_id) const {
+  int64_t answer_length = generated_tokens.size(1);
+  torch::Tensor eos_positions = generated_tokens.eq(eos_token_id).nonzero();
+  if (eos_positions.numel() > 0) {
+    answer_length = eos_positions[0][1].item<int64_t>() + 1;
+  }
+
+  torch::Tensor truncated_tokens =
+      generated_tokens.slice(/*dim=*/1, 0, answer_length);
+  torch::Tensor unresolved_positions =
+      truncated_tokens.eq(mask_token_id).nonzero();
+  if (unresolved_positions.numel() == 0) {
+    return answer_length;
+  }
+
+  const int64_t first_mask_index = unresolved_positions[0][1].item<int64_t>();
+  LOG(ERROR) << "LLaDA generation ended with unresolved mask tokens"
+             << ", rank=" << runtime_.context->get_parallel_args().rank()
+             << ", prompt_tokens=" << generated_tokens.size(1)
+             << ", first_unresolved_index=" << first_mask_index;
+  return std::max<int64_t>(first_mask_index, 0);
+}
+
+RawForwardOutput RecWorkerImpl::LLaDARecWorkPipeline::build_raw_output(
+    const torch::Tensor& generated_tokens,
+    int64_t answer_length) const {
+  RawForwardOutput raw_output;
+  RawSampleOutput sample;
+  sample.tokens.reserve(answer_length);
+
+  const auto accessor = generated_tokens.accessor<int32_t, 2>();
+  for (int64_t i = 0; i < answer_length; ++i) {
+    RawToken token;
+    token.id = accessor[0][i];
+    sample.tokens.push_back(std::move(token));
+  }
+
+  raw_output.outputs.push_back(std::move(sample));
+  return raw_output;
+}
+
 torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
     const torch::Tensor& logits,
     const SamplingParameters& sampling_params) {
@@ -1742,21 +1818,9 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
       (prompt_length + gen_length + block_length - 1) / block_length;
   const int32_t total_length = num_blocks * block_length;
 
-  torch::Tensor prompt = input.token_ids.view({1, -1}).to(token_options);
-  torch::Tensor x =
-      torch::full({1, total_length}, FLAGS_llada_mask_id, token_options);
-  x.slice(/*dim=*/1, 0, prompt_length).copy_(prompt);
+  torch::Tensor x = initialize_tokens(input, prompt_length, total_length);
   torch::Tensor position_ids =
       torch::arange(total_length, token_options).view({1, total_length});
-
-  torch::Tensor block_mask = torch::tril(torch::ones(
-      {num_blocks, num_blocks},
-      torch::TensorOptions().device(device).dtype(torch::kFloat32)));
-  torch::Tensor attention_mask = block_mask.repeat_interleave(block_length, 0)
-                                     .repeat_interleave(block_length, 1)
-                                     .unsqueeze(0)
-                                     .unsqueeze(0);
-  attention_mask = (torch::ones_like(attention_mask) - attention_mask) * -1e9;
 
   const int32_t prefill_blocks = prompt_length / block_length;
   bool eos_early_stopped = false;
@@ -1767,8 +1831,8 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
     torch::Tensor cur_x = x.slice(1, 0, current_window_end).clone();
     torch::Tensor cur_positions =
         position_ids.slice(1, 0, current_window_end).reshape({-1});
-    torch::Tensor cur_attn_mask = attention_mask.slice(2, 0, current_window_end)
-                                      .slice(3, 0, current_window_end);
+    torch::Tensor cur_attn_mask =
+        build_attention_mask(current_window_end, block_length);
     const int32_t block_start_pos = num_block * block_length;
 
     int32_t post_steps = 0;
@@ -1896,29 +1960,14 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
   torch::Tensor generated_answer = x.slice(1, 0, prompt_length + gen_length);
   torch::Tensor generated_tokens =
       generated_answer.slice(1, prompt_length, prompt_length + gen_length);
-  torch::Tensor eos_positions =
-      generated_tokens.eq(runtime_.context->get_model_args().eos_token_id())
-          .nonzero();
-  int64_t answer_length = gen_length;
-  if (eos_positions.numel() > 0) {
-    answer_length = eos_positions[0][1].item<int64_t>() + 1;
-  }
-  generated_tokens =
-      generated_tokens.slice(1, 0, answer_length).to(torch::kCPU);
-
-  CHECK(!generated_tokens.eq(FLAGS_llada_mask_id).any().item<bool>())
-      << "LLaDA generation ended with unresolved mask tokens.";
-
-  RawForwardOutput raw_output;
-  RawSampleOutput sample;
-  auto accessor = generated_tokens.accessor<int, 2>();
-  sample.tokens.reserve(answer_length);
-  for (int64_t i = 0; i < answer_length; ++i) {
-    RawToken token;
-    token.id = accessor[0][i];
-    sample.tokens.push_back(std::move(token));
-  }
-  raw_output.outputs.push_back(std::move(sample));
+  generated_tokens = generated_tokens.to(torch::kCPU);
+  const int64_t answer_length =
+      finalize_answer_length(generated_tokens,
+                             runtime_.context->get_model_args().eos_token_id(),
+                             FLAGS_llada_mask_id);
+  generated_tokens = generated_tokens.slice(1, 0, answer_length);
+  RawForwardOutput raw_output =
+      build_raw_output(generated_tokens, answer_length);
 
   LOG(INFO) << "LLaDA worker finished generation"
             << ", rank=" << runtime_.context->get_parallel_args().rank()

@@ -285,6 +285,16 @@ class RecWorkerImpl : public LLMWorkerImpl {
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
    private:
+    torch::Tensor build_attention_mask(int32_t active_length,
+                                       int32_t block_length) const;
+    torch::Tensor initialize_tokens(const ForwardInput& input,
+                                    int32_t prompt_length,
+                                    int32_t total_length) const;
+    int64_t finalize_answer_length(const torch::Tensor& generated_tokens,
+                                   int32_t eos_token_id,
+                                   int32_t mask_token_id) const;
+    RawForwardOutput build_raw_output(const torch::Tensor& generated_tokens,
+                                      int64_t answer_length) const;
     torch::Tensor sample_next_tokens(const torch::Tensor& logits,
                                      const SamplingParameters& sampling_params);
   };

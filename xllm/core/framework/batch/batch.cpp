@@ -170,6 +170,7 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
   refresh_output_targets();
 
   auto builder = RecBatchInputBuilder::create(rec_type,
+                                              get_sequences(),
                                               sequence_groups_,
                                               allowed_max_tokens_,
                                               input_embeddings_vec_,

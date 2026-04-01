@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "core/common/global_flags.h"
@@ -91,6 +92,45 @@ inline constexpr RecModelKind get_rec_model_kind(std::string_view model_type) {
     return RecModelKind::kLLaDARec;
   }
   return RecModelKind::kNone;
+}
+
+template <typename OptionsT>
+bool validate_llada_runtime_options(const OptionsT& options,
+                                    std::string* error_message) {
+  if (options.enable_chunked_prefill()) {
+    *error_message = "LLaDA does not support chunked prefill";
+    return false;
+  }
+  if (options.enable_prefix_cache()) {
+    *error_message = "LLaDA does not support prefix cache";
+    return false;
+  }
+  if (options.enable_schedule_overlap()) {
+    *error_message = "LLaDA does not support schedule overlap";
+    return false;
+  }
+  if (options.enable_disagg_pd() || options.enable_service_routing()) {
+    *error_message = "LLaDA does not support PD/service routing modes";
+    return false;
+  }
+  if (options.num_speculative_tokens() > 0) {
+    *error_message = "LLaDA does not support speculative decode";
+    return false;
+  }
+  if (options.max_seqs_per_batch() != 1) {
+    *error_message = "LLaDA requires max_seqs_per_batch=1";
+    return false;
+  }
+  if (options.rec_worker_max_concurrency() != 1) {
+    *error_message = "LLaDA requires rec_worker_max_concurrency=1";
+    return false;
+  }
+  if (options.dp_size() != 1 || options.cp_size() != 1 ||
+      options.ep_size() != 1) {
+    *error_message = "LLaDA v1 only supports TP-only parallelism";
+    return false;
+  }
+  return true;
 }
 
 }  // namespace xllm

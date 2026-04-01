@@ -72,44 +72,6 @@ RecType get_rec_type(const ModelArgs& model_args) {
   return RecType::kNone;
 }
 
-bool validate_llada_runtime_options(const Options& options,
-                                    std::string* error_message) {
-  if (options.enable_chunked_prefill()) {
-    *error_message = "LLaDA does not support chunked prefill";
-    return false;
-  }
-  if (options.enable_prefix_cache()) {
-    *error_message = "LLaDA does not support prefix cache";
-    return false;
-  }
-  if (options.enable_schedule_overlap()) {
-    *error_message = "LLaDA does not support schedule overlap";
-    return false;
-  }
-  if (options.enable_disagg_pd() || options.enable_service_routing()) {
-    *error_message = "LLaDA does not support PD/service routing modes";
-    return false;
-  }
-  if (options.num_speculative_tokens() > 0) {
-    *error_message = "LLaDA does not support speculative decode";
-    return false;
-  }
-  if (options.max_seqs_per_batch() != 1) {
-    *error_message = "LLaDA requires max_seqs_per_batch=1";
-    return false;
-  }
-  if (options.rec_worker_max_concurrency() != 1) {
-    *error_message = "LLaDA requires rec_worker_max_concurrency=1";
-    return false;
-  }
-  if (options.dp_size() != 1 || options.cp_size() != 1 ||
-      options.ep_size() != 1) {
-    *error_message = "LLaDA v1 only supports TP-only parallelism";
-    return false;
-  }
-  return true;
-}
-
 bool validate_llada_request(
     const RequestParams& sp,
     const std::optional<std::vector<proto::InferInputTensor>>& input_tensors,
@@ -144,6 +106,11 @@ bool validate_llada_request(
   if (sp.n != 1) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "LLaDA v1 only supports n=1");
+    return false;
+  }
+  if (!sp.sample_slots.empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLaDA does not support sample_slots");
     return false;
   }
   if (input_tensors.has_value() && !input_tensors->empty()) {

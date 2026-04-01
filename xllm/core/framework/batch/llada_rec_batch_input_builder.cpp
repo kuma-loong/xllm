@@ -24,6 +24,7 @@ limitations under the License.
 namespace xllm {
 
 LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
+    const std::vector<Sequence*>& sequences,
     const std::vector<SequencesGroup*>& sequence_groups,
     const std::vector<uint32_t>& allowed_max_tokens,
     const std::vector<torch::Tensor>& input_embeddings_vec,
@@ -33,7 +34,9 @@ LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
     ThreadPool* thread_pool)
-    : allowed_max_tokens_(allowed_max_tokens), batch_id_(batch_id) {
+    : sequences_(sequences),
+      allowed_max_tokens_(allowed_max_tokens),
+      batch_id_(batch_id) {
   (void)input_embeddings_vec;
   (void)mm_data_vec;
   (void)swap_block_transfer_infos;
@@ -41,12 +44,14 @@ LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
   (void)batch_forward_type;
   (void)thread_pool;
 
-  for (auto* sequence_group : sequence_groups) {
-    if (sequence_group == nullptr) {
-      continue;
-    }
-    for (const auto& sequence : sequence_group->sequences()) {
-      sequences_.push_back(sequence.get());
+  if (sequences_.empty()) {
+    for (auto* sequence_group : sequence_groups) {
+      if (sequence_group == nullptr) {
+        continue;
+      }
+      for (const auto& sequence : sequence_group->sequences()) {
+        sequences_.push_back(sequence.get());
+      }
     }
   }
 }

@@ -40,46 +40,6 @@ limitations under the License.
 
 namespace xllm {
 
-namespace {
-
-bool validate_llada_engine_options(const runtime::Options& options,
-                                   std::string* error_message) {
-  if (options.enable_chunked_prefill()) {
-    *error_message = "LLaDA does not support chunked prefill";
-    return false;
-  }
-  if (options.enable_prefix_cache()) {
-    *error_message = "LLaDA does not support prefix cache";
-    return false;
-  }
-  if (options.enable_schedule_overlap()) {
-    *error_message = "LLaDA does not support schedule overlap";
-    return false;
-  }
-  if (options.enable_disagg_pd() || options.enable_service_routing()) {
-    *error_message = "LLaDA does not support PD/service routing modes";
-    return false;
-  }
-  if (options.num_speculative_tokens() > 0) {
-    *error_message = "LLaDA does not support speculative decode";
-    return false;
-  }
-  if (options.max_seqs_per_batch() != 1 ||
-      options.rec_worker_max_concurrency() != 1) {
-    *error_message =
-        "LLaDA requires max_seqs_per_batch=1 and rec_worker_max_concurrency=1";
-    return false;
-  }
-  if (options.dp_size() != 1 || options.cp_size() != 1 ||
-      options.ep_size() != 1) {
-    *error_message = "LLaDA v1 only supports TP-only parallelism";
-    return false;
-  }
-  return true;
-}
-
-}  // namespace
-
 // ============================================================
 // RecEngine Implementation
 // ============================================================
@@ -128,7 +88,7 @@ bool RecEngine::init_model() {
   rec_model_kind_ = get_rec_model_kind(args_.model_type());
   if (rec_model_kind_ == RecModelKind::kLLaDARec) {
     std::string error_message;
-    if (!validate_llada_engine_options(options_, &error_message)) {
+    if (!validate_llada_runtime_options(options_, &error_message)) {
       LOG(ERROR) << error_message;
       return false;
     }
@@ -792,10 +752,15 @@ bool RecEngine::LLaDARecEnginePipeline::init_model_workers(
 
 #if defined(USE_NPU)
   if (world_size == 1) {
+    const std::string master_node_addr =
+        engine_.options_.master_node_addr().value_or("");
+    if (master_node_addr.empty()) {
+      LOG(ERROR) << "LLaDA single-device runtime requires master_node_addr.";
+      return false;
+    }
     std::string host;
-    int port;
-    net::parse_host_port_from_addr(
-        engine_.options_.master_node_addr().value(), host, port);
+    int32_t port = 0;
+    net::parse_host_port_from_addr(master_node_addr, host, port);
     engine_.process_groups_.clear();
     engine_.process_groups_.emplace_back(create_process_group(
         /*rank=*/0,

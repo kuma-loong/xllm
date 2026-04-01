@@ -29,6 +29,7 @@ namespace xllm {
 
 std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
     RecType rec_type,
+    const std::vector<Sequence*>& sequences,
     const std::vector<SequencesGroup*>& sequence_groups,
     const std::vector<uint32_t>& allowed_max_tokens,
     const std::vector<torch::Tensor>& input_embeddings_vec,
@@ -68,6 +69,7 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
       break;
     case RecType::kLLaDARec:
       return std::make_unique<LLaDARecBatchInputBuilder>(
+          sequences,
           sequence_groups,
           allowed_max_tokens,
           input_embeddings_vec,
