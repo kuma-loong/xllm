@@ -438,17 +438,6 @@ FixedStepsScheduler::RecMultiRoundSchedulerPipeline::create_batches(
       scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
-std::vector<Batch>
-FixedStepsScheduler::LLaDARecSchedulerPipeline::create_batches(
-    FixedStepsScheduler& scheduler,
-    BatchFactory* batch_factory) {
-  return batch_factory->create_rec_batches(
-      scheduler.running_requests_,
-      scheduler.running_sequences_,
-      scheduler.running_sequences_budgets_,
-      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
-}
-
 std::unique_ptr<FixedStepsScheduler::SchedulerPipeline>
 FixedStepsScheduler::create_scheduler_pipeline(RecType rec_type,
                                                bool is_rec_multi_round) {
@@ -457,9 +446,6 @@ FixedStepsScheduler::create_scheduler_pipeline(RecType rec_type,
   }
   if (rec_type == RecType::kLlmRec) {
     return std::make_unique<LlmRecSchedulerPipeline>();
-  }
-  if (rec_type == RecType::kLLaDARec) {
-    return std::make_unique<LLaDARecSchedulerPipeline>();
   }
   return std::make_unique<OneRecSchedulerPipeline>();
 }

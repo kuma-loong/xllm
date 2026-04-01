@@ -35,6 +35,7 @@ limitations under the License.
 #include "rec_engine.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/scheduler_factory.h"
+#include "util/device_name_utils.h"
 #include "util/scope_guard.h"
 #include "util/threadpool.h"
 #include "util/utils.h"
@@ -78,44 +79,84 @@ bool validate_llada_request(
     OutputCallback callback) {
   if (sp.streaming) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA does not support streaming responses");
+                        "LLaDA request_validation failed: "
+                        "streaming responses are unsupported");
     return false;
   }
   if (sp.beam_width > 1) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA does not support beam search");
+                        "LLaDA request_validation failed: "
+                        "beam search is unsupported");
     return false;
   }
   if (sp.best_of.value_or(sp.n) != sp.n) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA requires best_of to equal n");
+                        "LLaDA request_validation failed: "
+                        "best_of must equal n");
     return false;
   }
   if (sp.logprobs || sp.top_logprobs > 0) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA does not support logprobs");
+                        "LLaDA request_validation failed: "
+                        "logprobs are unsupported");
     return false;
   }
   if (sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f ||
       sp.repetition_penalty != 1.0f) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
-        "LLaDA does not support repetition or presence penalties");
+        "LLaDA request_validation failed: penalties are unsupported");
     return false;
   }
   if (sp.n != 1) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA v1 only supports n=1");
+                        "LLaDA request_validation failed: n must equal 1");
     return false;
   }
   if (!sp.sample_slots.empty()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA does not support sample_slots");
+                        "LLaDA request_validation failed: sample_slots are "
+                        "unsupported");
     return false;
   }
   if (input_tensors.has_value() && !input_tensors->empty()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA does not support input_tensors");
+                        "LLaDA request_validation failed: input_tensors are "
+                        "unsupported");
+    return false;
+  }
+  return true;
+}
+
+bool build_prompt_tokens(const std::string& prompt,
+                         const std::optional<std::vector<int>>& prompt_tokens,
+                         Tokenizer* tokenizer,
+                         bool add_special_tokens,
+                         const std::string& tokenizer_required_message,
+                         const std::string& tokenization_failed_message,
+                         const std::string& missing_prompt_message,
+                         std::vector<int32_t>* local_prompt_tokens,
+                         OutputCallback callback) {
+  if (prompt_tokens.has_value()) {
+    local_prompt_tokens->assign(prompt_tokens->begin(), prompt_tokens->end());
+  } else if (!prompt.empty()) {
+    if (tokenizer == nullptr) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          tokenizer_required_message);
+      return false;
+    }
+    std::vector<int> temporary_tokens;
+    if (!tokenizer->encode(prompt, &temporary_tokens, add_special_tokens)) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          tokenization_failed_message);
+      return false;
+    }
+    local_prompt_tokens->assign(temporary_tokens.begin(),
+                                temporary_tokens.end());
+  }
+
+  if (local_prompt_tokens->empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, missing_prompt_message);
     return false;
   }
   return true;
@@ -394,31 +435,16 @@ std::shared_ptr<Request> RecMaster::LlmRecMasterPipeline::generate_request(
   std::vector<int32_t> local_prompt_tokens;
   MMData processed_mm_data;
 
-  // LlmRec without mm_data: use prompt_tokens or tokenize prompt string
-  if (prompt_tokens.has_value()) {
-    local_prompt_tokens.assign(prompt_tokens.value().begin(),
-                               prompt_tokens.value().end());
-  } else if (!prompt.empty()) {
-    // Tokenize prompt string if prompt_tokens not provided
-    if (!master_.tokenizer_) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Tokenizer is required for prompt-based input");
-      return nullptr;
-    }
-    std::vector<int> tmp_tokens;
-    if (!master_.tokenizer_->encode(
-            prompt, &tmp_tokens, sp.add_special_tokens)) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Failed to tokenize prompt");
-      return nullptr;
-    }
-    local_prompt_tokens.assign(tmp_tokens.begin(), tmp_tokens.end());
-  }
-
-  if (local_prompt_tokens.empty()) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::INVALID_ARGUMENT,
-        "LlmRec requires prompt or prompt_tokens to be provided");
+  if (!build_prompt_tokens(prompt,
+                           prompt_tokens,
+                           master_.tokenizer_.get(),
+                           sp.add_special_tokens,
+                           "Tokenizer is required for prompt-based input",
+                           "Failed to tokenize prompt",
+                           "LlmRec requires prompt or prompt_tokens to be "
+                           "provided",
+                           &local_prompt_tokens,
+                           callback)) {
     return nullptr;
   }
 
@@ -515,31 +541,28 @@ std::shared_ptr<Request> RecMaster::LLaDARecMasterPipeline::generate_request(
   if (!validate_llada_request(sp, input_tensors, callback)) {
     return nullptr;
   }
+  LOG(INFO) << "LLaDA generate_request"
+            << ", model_type=" << master_.model_args_.model_type()
+            << ", rec_type=" << static_cast<int32_t>(master_.rec_type())
+            << ", pipeline_type="
+            << rec_pipeline_type_to_string(get_rec_pipeline_type(
+                   get_rec_model_kind(master_.model_args_.model_type())))
+            << ", max_tokens=" << sp.max_tokens
+            << ", temperature=" << sp.temperature << ", top_p=" << sp.top_p
+            << ", top_k=" << sp.top_k;
 
   std::vector<int32_t> local_prompt_tokens;
   MMData processed_mm_data;
 
-  if (prompt_tokens.has_value()) {
-    local_prompt_tokens.assign(prompt_tokens->begin(), prompt_tokens->end());
-  } else if (!prompt.empty()) {
-    if (!master_.tokenizer_) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Tokenizer is required for LLaDA prompt input");
-      return nullptr;
-    }
-    std::vector<int> tmp_tokens;
-    if (!master_.tokenizer_->encode(
-            prompt, &tmp_tokens, sp.add_special_tokens)) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Failed to tokenize LLaDA prompt");
-      return nullptr;
-    }
-    local_prompt_tokens.assign(tmp_tokens.begin(), tmp_tokens.end());
-  }
-
-  if (local_prompt_tokens.empty()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA requires prompt or prompt_tokens");
+  if (!build_prompt_tokens(prompt,
+                           prompt_tokens,
+                           master_.tokenizer_.get(),
+                           sp.add_special_tokens,
+                           "Tokenizer is required for LLaDA prompt input",
+                           "Failed to tokenize LLaDA prompt",
+                           "LLaDA requires prompt or prompt_tokens",
+                           &local_prompt_tokens,
+                           callback)) {
     return nullptr;
   }
 
@@ -595,6 +618,26 @@ RecMaster::RecMaster(const Options& options)
       !validate_llada_runtime_options(options_, &init_error_message_)) {
     LOG(ERROR) << init_error_message_;
     return;
+  }
+  if (rec_type_ == RecType::kLLaDARec) {
+    const auto devices =
+        DeviceNameUtils::parse_devices(options_.devices().value_or("auto"));
+    LLaDARuntimeConfig llada_runtime_config;
+    if (!load_llada_runtime_config(model_args_.eos_token_id(),
+                                   &llada_runtime_config,
+                                   &init_error_message_)) {
+      LOG(ERROR) << "LLaDA runtime_config_validation failed: "
+                 << init_error_message_;
+      return;
+    }
+    LOG(INFO) << "LLaDA master config"
+              << ", model_type=" << model_args_.model_type()
+              << ", rec_type=" << static_cast<int32_t>(rec_type_)
+              << ", pipeline_type="
+              << rec_pipeline_type_to_string(get_rec_pipeline_type(
+                     get_rec_model_kind(model_args_.model_type())))
+              << ", tp_size=" << devices.size() << ", "
+              << llada_runtime_config_to_string(llada_runtime_config);
   }
 
   if (options_.enable_service_routing()) {

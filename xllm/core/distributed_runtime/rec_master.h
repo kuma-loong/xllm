@@ -48,7 +48,7 @@ class RecMaster : public Master {
       OutputCallback callback);
 
   // chat
-  // Only supported for LlmRec models.
+  // Only supported for chat-capable rec models.
   void handle_request(
       std::vector<Message> messages,
       std::optional<std::vector<int>> prompt_tokens,

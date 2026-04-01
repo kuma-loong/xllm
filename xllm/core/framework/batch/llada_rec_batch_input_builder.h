@@ -29,7 +29,7 @@ limitations under the License.
 
 namespace xllm {
 
-class LLaDARecBatchInputBuilder : public RecBatchInputBuilder {
+class LLaDARecBatchInputBuilder final : public RecBatchInputBuilder {
  public:
   explicit LLaDARecBatchInputBuilder(
       const std::vector<Sequence*>& sequences,

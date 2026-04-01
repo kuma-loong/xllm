@@ -28,17 +28,7 @@ limitations under the License.
 #include "models/rec/rec_model_base.h"
 
 namespace xllm {
-
-namespace {
-
-inline bool has_parallel_linear_weight(const StateDict& state_dict) {
-  return state_dict.get_tensor("weight").defined() ||
-         state_dict.get_tensor("qweight").defined();
-}
-
-}  // namespace
-
-class LLaDA2MoeModelImpl : public torch::nn::Module {
+class LLaDA2MoeModelImpl final : public torch::nn::Module {
  public:
   explicit LLaDA2MoeModelImpl(const ModelContext& context)
       : model_args_(context.get_model_args()),
@@ -160,7 +150,7 @@ class LLaDA2MoeModelImpl : public torch::nn::Module {
 };
 TORCH_MODULE(LLaDA2MoeModel);
 
-class LLaDA2MoeForConditionalGenerationImpl
+class LLaDA2MoeForConditionalGenerationImpl final
     : public RecForCausalLMImplBase<LLaDA2MoeModel> {
  public:
   explicit LLaDA2MoeForConditionalGenerationImpl(const ModelContext& context)
@@ -195,6 +185,11 @@ class LLaDA2MoeForConditionalGenerationImpl
   }
 
  private:
+  static bool has_parallel_linear_weight(const StateDict& state_dict) {
+    return state_dict.get_tensor("weight").defined() ||
+           state_dict.get_tensor("qweight").defined();
+  }
+
   bool lm_head_is_loaded_ = false;
 };
 TORCH_MODULE(LLaDA2MoeForConditionalGeneration);

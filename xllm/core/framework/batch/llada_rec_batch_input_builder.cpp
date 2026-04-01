@@ -23,6 +23,42 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+std::vector<Sequence*> collect_sequences(
+    const std::vector<Sequence*>& sequences,
+    const std::vector<SequencesGroup*>& sequence_groups) {
+  if (!sequences.empty()) {
+    return sequences;
+  }
+
+  std::vector<Sequence*> collected_sequences;
+  for (SequencesGroup* sequence_group : sequence_groups) {
+    if (sequence_group == nullptr) {
+      continue;
+    }
+    for (const auto& sequence : sequence_group->sequences()) {
+      collected_sequences.push_back(sequence.get());
+    }
+  }
+  return collected_sequences;
+}
+
+std::vector<int32_t> build_positions(int32_t prompt_length) {
+  std::vector<int32_t> positions;
+  positions.reserve(prompt_length);
+  for (int32_t index = 0; index < prompt_length; ++index) {
+    positions.push_back(index);
+  }
+  return positions;
+}
+
+torch::Tensor make_seq_len_tensor(int32_t prompt_length) {
+  return torch::tensor({prompt_length}, torch::dtype(torch::kInt32));
+}
+
+}  // namespace
+
 LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
     const std::vector<Sequence*>& sequences,
     const std::vector<SequencesGroup*>& sequence_groups,
@@ -34,7 +70,7 @@ LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
     ThreadPool* thread_pool)
-    : sequences_(sequences),
+    : sequences_(collect_sequences(sequences, sequence_groups)),
       allowed_max_tokens_(allowed_max_tokens),
       batch_id_(batch_id) {
   (void)input_embeddings_vec;
@@ -44,16 +80,7 @@ LLaDARecBatchInputBuilder::LLaDARecBatchInputBuilder(
   (void)batch_forward_type;
   (void)thread_pool;
 
-  if (sequences_.empty()) {
-    for (auto* sequence_group : sequence_groups) {
-      if (sequence_group == nullptr) {
-        continue;
-      }
-      for (const auto& sequence : sequence_group->sequences()) {
-        sequences_.push_back(sequence.get());
-      }
-    }
-  }
+  (void)sequence_groups;
 }
 
 ForwardInput LLaDARecBatchInputBuilder::build_rec_forward_input(
@@ -75,11 +102,7 @@ ForwardInput LLaDARecBatchInputBuilder::build_rec_forward_input(
   CHECK_GT(prompt_length, 0) << "LLaDA prompt tokens must not be empty.";
 
   std::vector<int32_t> flat_tokens(token_ids.begin(), token_ids.end());
-  std::vector<int32_t> positions;
-  positions.reserve(flat_tokens.size());
-  for (int32_t i = 0; i < prompt_length; ++i) {
-    positions.push_back(i);
-  }
+  std::vector<int32_t> positions = build_positions(prompt_length);
 
   SamplingParameters sampling_params;
   sampling_params.init({sequence->sampling_param()},
@@ -97,10 +120,8 @@ ForwardInput LLaDARecBatchInputBuilder::build_rec_forward_input(
   input.input_params.num_sequences = 1;
   input.input_params.kv_max_seq_len = prompt_length;
   input.input_params.q_max_seq_len = prompt_length;
-  input.input_params.q_seq_lens =
-      torch::tensor({prompt_length}, torch::dtype(torch::kInt32));
-  input.input_params.kv_seq_lens =
-      torch::tensor({prompt_length}, torch::dtype(torch::kInt32));
+  input.input_params.q_seq_lens = make_seq_len_tensor(prompt_length);
+  input.input_params.kv_seq_lens = make_seq_len_tensor(prompt_length);
   input.input_params.q_cu_seq_lens =
       torch::tensor({0, prompt_length}, torch::dtype(torch::kInt32));
   input.input_params.q_seq_lens_vec = {prompt_length};
