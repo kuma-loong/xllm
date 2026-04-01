@@ -1,0 +1,896 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <c10/core/DeviceGuard.h>
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <memory>
+#include <optional>
+#include <shared_mutex>
+
+#include "common/device_monitor.h"
+#include "common/metrics.h"
+#include "core/common/global_flags.h"
+#include "framework/sampling/rec_sampler.h"
+#include "rec_worker_impl.h"
+#if defined(USE_CUDA)
+#include "kernels/cuda/cuda_ops_api.h"
+#include "platform/cuda/device_capture_lock.h"
+#endif
+#if defined(USE_NPU)
+#include "kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
+#include "util/timer.h"
+
+namespace xllm {
+
+RecWorkerImpl::LlmRecMultiRoundPipeline::LlmRecMultiRoundPipeline(
+    RecPipelineRuntime& runtime)
+    : RecWorkPipeline(runtime),
+      rec_sampler_(std::make_unique<RecSampler>(
+          RecPipelineType::kLlmRecMultiRoundPipeline)) {
+  max_seqs_per_batch_ = runtime_.worker.options_.max_seqs_per_batch();
+  max_tokens_per_batch_ = runtime_.worker.options_.max_tokens_per_batch();
+  max_token_per_req_ = max_seqs_per_batch_ > 0
+                           ? (max_tokens_per_batch_ / max_seqs_per_batch_)
+                           : 0;
+  beam_width_ = runtime_.worker.options_.beam_width();
+
+  full_kv_cache_offsets_ = std::make_unique<FullKvCacheOffsets>(this);
+  allocate_kv_caches_related();
+}
+
+ForwardInput RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_inputs(
+    Batch& batch) {
+  ThreadPool* thread_pool =
+      runtime_.worker.input_builder_thread_pool_
+          ? runtime_.worker.input_builder_thread_pool_.get()
+          : nullptr;
+
+  return batch.prepare_rec_forward_input(
+      runtime_.worker.options_.num_decoding_tokens(),
+      /*min_decoding_batch_size=*/0,
+      runtime_.context->get_model_args(),
+      thread_pool);
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_work_before_execute(
+    const ForwardInput& inputs,
+    ForwardInput& processed_inputs) {
+  RecWorkPipeline::prepare_work_before_execute(inputs, processed_inputs);
+
+  runtime_.worker.prepare_multi_modal_data(processed_inputs);
+
+#if defined(USE_NPU) || defined(USE_CUDA)
+  prepare_kv_caches_related_for_input(inputs, processed_inputs);
+#endif
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::allocate_kv_caches_related() {
+  auto dtype = runtime_.worker.dtype();
+  auto device = runtime_.worker.device();
+  auto kv_cache_options = torch::TensorOptions().dtype(dtype).device(device);
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  int32_t num_layers = runtime_.context->get_model_args().n_layers();
+
+  int32_t full_kv_len =
+      max_tokens_per_batch_ + max_seqs_per_batch_ * beam_width_ *
+                                  (get_rec_multi_round_decode_rounds() - 1);
+  int64_t num_kv_heads =
+      runtime_.context->get_model_args().n_kv_heads().value_or(
+          runtime_.context->get_model_args().n_heads());
+  int64_t head_dim = runtime_.context->get_model_args().head_dim();
+
+  cached_full_k_caches_.resize(num_layers);
+  cached_full_v_caches_.resize(num_layers);
+
+  for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+#if defined(USE_NPU)
+    const int64_t full_kv_elems =
+        static_cast<int64_t>(full_kv_len) * num_kv_heads * head_dim;
+    auto target_layer_full_k_cache =
+        torch::zeros({full_kv_elems}, kv_cache_options);
+    auto target_layer_full_v_cache =
+        torch::zeros({full_kv_elems}, kv_cache_options);
+#else
+    auto target_layer_full_k_cache =
+        torch::zeros({full_kv_len, num_kv_heads, head_dim}, kv_cache_options);
+    auto target_layer_full_v_cache =
+        torch::zeros({full_kv_len, num_kv_heads, head_dim}, kv_cache_options);
+#endif
+
+    cached_full_k_caches_[layer_id] = target_layer_full_k_cache;
+    cached_full_v_caches_[layer_id] = target_layer_full_v_cache;
+  }
+
+#if defined(USE_NPU)
+  cached_naive_block_table_ = torch::arange(max_seqs_per_batch_, int_options);
+#else
+  cached_naive_block_table_ =
+      torch::arange(max_seqs_per_batch_ * beam_width_, int_options)
+          .unsqueeze(1);
+#endif
+  cached_current_round_tensor_ = torch::zeros({1}, int_options);
+  cached_beam_width_tensor_ = torch::zeros({1}, int_options);
+
+  if (FLAGS_enable_xattention_one_stage) {
+    return;
+  }
+
+  const int64_t num_heads = runtime_.context->get_model_args().n_heads();
+  const int64_t max_total_beam =
+      static_cast<int64_t>(max_seqs_per_batch_) * beam_width_;
+  auto fp32_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  cached_two_stage_shared_lse_ =
+      torch::zeros({max_total_beam, num_heads, 1}, fp32_options);
+  cached_two_stage_shared_o_ =
+      torch::zeros({max_total_beam, num_heads, head_dim}, kv_cache_options);
+  cached_two_stage_unshared_lse_ =
+      torch::zeros({max_total_beam, num_heads, 1}, fp32_options);
+  cached_two_stage_unshared_o_ =
+      torch::zeros({max_total_beam, num_heads, head_dim}, kv_cache_options);
+  cached_two_stage_q_cu_seq_lens_shared_ =
+      torch::zeros({max_seqs_per_batch_ + 1}, int_options);
+  cached_two_stage_paged_kv_indptr_expanded_ =
+      torch::zeros({max_total_beam + 1}, int_options);
+  cached_two_stage_paged_kv_indices_expanded_ =
+      torch::zeros({max_total_beam}, int_options);
+  cached_two_stage_paged_kv_last_page_len_expanded_ =
+      torch::zeros({max_total_beam}, int_options);
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::
+    prepare_kv_caches_related_for_input(const ForwardInput& inputs,
+                                        ForwardInput& processed_inputs) {
+  auto device = runtime_.worker.device();
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto& input_params = processed_inputs.input_params;
+  auto& llm_rec_params = input_params.mutable_llmrec_params();
+
+  const auto* step_meta = inputs.step_meta();
+  CHECK(step_meta != nullptr)
+      << "step_meta is required for rec multi-round mode";
+  int32_t batch_size = step_meta->batch_size;
+  int32_t beam_width = step_meta->beam_width;
+  int32_t total_round = step_meta->total_round;
+  llm_rec_params.batch_size = batch_size;
+  llm_rec_params.beam_width = beam_width;
+  llm_rec_params.total_round = total_round;
+  const auto& shape = step_meta->full_kv_shape;
+  CHECK(shape.size() == 3) << "the dims of full_kv_shape should be three.";
+  int32_t full_kv_len = shape[0];
+  int64_t num_kv_heads = shape[1];
+  int64_t head_dim = shape[2];
+  int32_t num_layers = runtime_.context->get_model_args().n_layers();
+  int32_t max_decode_step = total_round - 1;
+  int32_t unshared_offset = max_tokens_per_batch_;
+
+  if (!cached_full_k_caches_.empty() && cached_full_k_caches_[0].defined()) {
+    llm_rec_params.full_k_caches.reserve(num_layers);
+    llm_rec_params.full_v_caches.reserve(num_layers);
+    llm_rec_params.unshared_k_caches.reserve(num_layers);
+    llm_rec_params.unshared_v_caches.reserve(num_layers);
+    llm_rec_params.shared_k_caches.reserve(num_layers);
+    llm_rec_params.shared_v_caches.reserve(num_layers);
+
+    for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+#if defined(USE_NPU)
+      auto layer_full_k_cache_flat = cached_full_k_caches_[layer_id];
+      auto layer_full_v_cache_flat = cached_full_v_caches_[layer_id];
+
+      const int64_t shared_kv_tokens = static_cast<int64_t>(unshared_offset);
+      const int64_t shared_kv_elems =
+          shared_kv_tokens * num_kv_heads * head_dim;
+      const int64_t full_kv_elems =
+          static_cast<int64_t>(full_kv_len) * num_kv_heads * head_dim;
+
+      auto layer_full_k_cache =
+          layer_full_k_cache_flat.view({full_kv_len, num_kv_heads, head_dim});
+      auto layer_full_v_cache =
+          layer_full_v_cache_flat.view({full_kv_len, num_kv_heads, head_dim});
+
+      auto layer_shared_k_cache =
+          layer_full_k_cache_flat.narrow(0, 0, shared_kv_elems)
+              .view({shared_kv_tokens, num_kv_heads, head_dim});
+      auto layer_shared_v_cache =
+          layer_full_v_cache_flat.narrow(0, 0, shared_kv_elems)
+              .view({shared_kv_tokens, num_kv_heads, head_dim});
+
+      auto layer_unshared_k_cache =
+          layer_full_k_cache_flat
+              .narrow(0, shared_kv_elems, full_kv_elems - shared_kv_elems)
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width),
+                     num_kv_heads,
+                     static_cast<int64_t>(max_decode_step),
+                     head_dim})
+              .slice(0, 0, batch_size);
+      auto layer_unshared_v_cache =
+          layer_full_v_cache_flat
+              .narrow(0, shared_kv_elems, full_kv_elems - shared_kv_elems)
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width),
+                     num_kv_heads,
+                     static_cast<int64_t>(max_decode_step),
+                     head_dim})
+              .slice(0, 0, batch_size);
+      llm_rec_params.shared_k_caches.emplace_back(layer_shared_k_cache);
+      llm_rec_params.shared_v_caches.emplace_back(layer_shared_v_cache);
+#else
+      auto layer_full_k_cache = cached_full_k_caches_[layer_id];
+      auto layer_full_v_cache = cached_full_v_caches_[layer_id];
+
+      auto layer_unshared_k_cache =
+          layer_full_k_cache.slice(0, unshared_offset, full_kv_len);
+      auto layer_unshared_v_cache =
+          layer_full_v_cache.slice(0, unshared_offset, full_kv_len);
+
+      layer_unshared_k_cache =
+          layer_unshared_k_cache
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width_),
+                     static_cast<int64_t>(max_decode_step),
+                     num_kv_heads,
+                     head_dim})
+              .slice(0, 0, batch_size);
+      layer_unshared_v_cache =
+          layer_unshared_v_cache
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width_),
+                     static_cast<int64_t>(max_decode_step),
+                     num_kv_heads,
+                     head_dim})
+              .slice(0, 0, batch_size);
+#endif
+
+      llm_rec_params.full_k_caches.emplace_back(layer_full_k_cache);
+      llm_rec_params.full_v_caches.emplace_back(layer_full_v_cache);
+      llm_rec_params.unshared_k_caches.emplace_back(layer_unshared_k_cache);
+      llm_rec_params.unshared_v_caches.emplace_back(layer_unshared_v_cache);
+    }
+  }
+
+#if defined(USE_NPU)
+  input_params.block_tables = cached_naive_block_table_.slice(0, 0, batch_size);
+#else
+  input_params.block_tables =
+      cached_naive_block_table_.slice(0, 0, batch_size * beam_width);
+#endif
+
+  const auto& decode_positions = step_meta->decode_positions_vec;
+  llm_rec_params.decode_positions_tensor_list.clear();
+  if (!decode_positions.empty() && beam_width > 0 && total_round > 1) {
+    const int32_t num_sequences = static_cast<int32_t>(decode_positions.size());
+    std::vector<int32_t> position_buffer;
+    position_buffer.reserve(static_cast<size_t>(num_sequences * beam_width));
+    for (int32_t round_idx = 0; round_idx < total_round - 1; ++round_idx) {
+      position_buffer.clear();
+      for (int32_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+        const int32_t base_position = decode_positions[seq_idx] + round_idx;
+        for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+          position_buffer.push_back(base_position);
+        }
+      }
+      llm_rec_params.decode_positions_tensor_list.push_back(
+          torch::tensor(position_buffer, int_options));
+    }
+  }
+}
+
+std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
+    const ForwardInput& input) {
+  Timer timer;
+  auto device = runtime_.worker.device_;
+  device.set_device();
+
+  ForwardInput& mutable_input = const_cast<ForwardInput&>(input);
+
+  const auto* step_meta = mutable_input.step_meta();
+  CHECK(step_meta != nullptr)
+      << "step_meta is required for rec multi-round mode";
+  int32_t total_rounds = step_meta->total_round;
+  int32_t max_decode_step = total_rounds - 1;
+  int32_t batch_size = step_meta->batch_size;
+  int32_t beam_width = step_meta->beam_width;
+  int32_t num_layers =
+      static_cast<int32_t>(runtime_.context->get_model_args().n_layers());
+
+  CHECK_GT(runtime_.worker.kv_caches_.size(), 0)
+      << "KV caches are not initialized.";
+
+  BeamSearchTensors beam_tensors =
+      prepare_beam_search_tensors(batch_size, beam_width, total_rounds, device);
+
+  ForwardOutput output;
+  torch::Tensor logits;
+  SampleOutput sample_output;
+  torch::Tensor top_tokens;
+  torch::Tensor top_logprobs;
+  std::optional<folly::SemiFuture<NextRoundInputResults>>
+      next_round_async_result;
+
+  for (int32_t round = 0; round < total_rounds; ++round) {
+    const auto& sampling_params = round > 0
+                                      ? mutable_input.decoder_sampling_params
+                                      : mutable_input.sampling_params;
+
+#if defined(USE_NPU)
+    prepare_round_input_for_npu(mutable_input, round, top_tokens, beam_tensors);
+#else
+    prepare_round_input_and_schedule_next(mutable_input,
+                                          round,
+                                          total_rounds,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result);
+#endif
+
+    auto model_output = runtime_.executor->forward(mutable_input.token_ids,
+                                                   mutable_input.positions,
+                                                   runtime_.worker.kv_caches_,
+                                                   mutable_input.input_params);
+    if (!model_output.hidden_states.defined()) {
+      return std::nullopt;
+    }
+    torch::Tensor hidden_states = model_output.hidden_states;
+
+    if (sampling_params.selected_token_idxes.defined()) {
+      logits = runtime_.model->logits(hidden_states,
+                                      sampling_params.selected_token_idxes);
+      sample_output = rec_sampler_->forward(logits, sampling_params);
+    }
+
+    if (sample_output.top_tokens.defined() &&
+        sample_output.top_logprobs.defined()) {
+      int64_t top_tokens_numel = sample_output.top_tokens.numel();
+      int64_t top_logprobs_numel = sample_output.top_logprobs.numel();
+      CHECK_EQ(top_tokens_numel % beam_width, 0)
+          << "top_tokens numel (" << top_tokens_numel
+          << ") must be divisible by beam_width (" << step_meta->beam_width
+          << ")";
+      CHECK_EQ(top_logprobs_numel % beam_width, 0)
+          << "top_logprobs numel (" << top_logprobs_numel
+          << ") must be divisible by beam_width (" << step_meta->beam_width
+          << ")";
+
+#if defined(USE_NPU)
+      if (round == 0) {
+        top_tokens =
+            sample_output.top_tokens.to(torch::kInt32).reshape({-1, 1});
+        top_logprobs = sample_output.top_logprobs.reshape({-1, 1});
+      } else {
+        top_tokens = sample_output.top_tokens.to(torch::kInt32);
+        top_logprobs = sample_output.top_logprobs;
+      }
+#else
+      top_tokens = sample_output.top_tokens.to(torch::kInt32)
+                       .reshape({-1, step_meta->beam_width});
+      top_logprobs = sample_output.top_logprobs.reshape({-1, beam_width});
+#endif
+      execute_beam_search(
+          top_tokens, top_logprobs, beam_tensors, round, batch_size);
+
+      if (round > 0 && round < total_rounds - 1) {
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, num_layers);
+      }
+
+      if (round == total_rounds - 1) {
+        build_final_output(
+            logits, sample_output, sampling_params, beam_tensors, output);
+      }
+    }
+  }
+
+  runtime_.stream->synchronize();
+
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+  DeviceMonitor::get_instance().update_active_activation_memory(device.index());
+  return output;
+}
+
+RecWorkerImpl::LlmRecMultiRoundPipeline::BeamSearchTensors
+RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_beam_search_tensors(
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Device& device) {
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto fp32_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+
+  BeamSearchTensors tensors;
+  tensors.sequence_group =
+      torch::zeros({batch_size, beam_width, total_rounds}, int_options);
+  int64_t num_seq = batch_size * beam_width;
+  tensors.acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_token_ids = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_token_index = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_beam_count_prefix_sums = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_seqgroup = torch::zeros_like(tensors.sequence_group);
+  return tensors;
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_beam_search(
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    BeamSearchTensors& beam_tensors,
+    int32_t round,
+    int32_t batch_size) {
+#if defined(USE_NPU)
+  xllm::kernel::npu::beam_search_rec(beam_tensors.acc_logprob,
+                                     top_tokens.to(torch::kInt32),
+                                     top_logprobs,
+                                     beam_tensors.sequence_group,
+                                     static_cast<int64_t>(round),
+                                     beam_tensors.out_token_ids,
+                                     beam_tensors.out_token_index,
+                                     beam_tensors.out_log_probs,
+                                     beam_tensors.out_beam_count_prefix_sums,
+                                     beam_tensors.out_seqgroup);
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
+                                  beam_tensors.sequence_group,
+                                  top_tokens,
+                                  top_logprobs,
+                                  beam_tensors.out_log_probs,
+                                  beam_tensors.out_token_ids,
+                                  beam_tensors.out_token_index,
+                                  beam_tensors.out_beam_count_prefix_sums,
+                                  beam_tensors.out_seqgroup,
+                                  batch_size,
+                                  round);
+#endif
+  std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
+  std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_cache_select(
+    const BeamSearchTensors& beam_tensors,
+    ForwardInput& input,
+    int32_t round,
+    int32_t beam_width,
+    int32_t num_layers) {
+#if defined(USE_NPU)
+  auto device = runtime_.worker.device();
+  auto int32_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+  const int32_t batch_size =
+      static_cast<int32_t>(beam_tensors.sequence_group.size(0));
+  auto batch_offsets = torch::arange(batch_size, int32_options) * beam_width;
+  auto batch_offsets_2d = batch_offsets.unsqueeze(1);
+
+  auto beam_index_global =
+      beam_tensors.out_token_index.reshape({batch_size, beam_width});
+  auto beam_index_local = beam_index_global - batch_offsets_2d;
+  auto group_prefix_global =
+      beam_tensors.out_beam_count_prefix_sums.reshape({batch_size, beam_width});
+  auto group_prefix_local = group_prefix_global - batch_offsets_2d;
+
+  auto block_table = torch::arange(batch_size, int32_options);
+
+  const auto& unshared_k_caches =
+      input.input_params.mutable_llmrec_params().unshared_k_caches;
+  const auto& unshared_v_caches =
+      input.input_params.mutable_llmrec_params().unshared_v_caches;
+
+  xllm::kernel::npu::select_unshared_kv(beam_index_local.reshape({-1}),
+                                        unshared_k_caches,
+                                        unshared_v_caches,
+                                        block_table,
+                                        group_prefix_local.reshape({-1}),
+                                        static_cast<int64_t>(round),
+                                        beam_width,
+                                        num_layers);
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::cache_select(
+      beam_tensors.out_token_index,
+      input.input_params.mutable_llmrec_params().unshared_k_caches,
+      input.input_params.mutable_llmrec_params().unshared_v_caches,
+      input.input_params.block_tables,
+      round - 1,
+      beam_width,
+      num_layers);
+#endif
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::build_final_output(
+    const torch::Tensor& logits,
+    const SampleOutput& sample_output,
+    const SamplingParameters& sampling_params,
+    const BeamSearchTensors& beam_tensors,
+    ForwardOutput& output) {
+  output.logits = logits;
+  output.sample_output = sample_output;
+  output.do_sample = sampling_params.do_sample;
+  output.logprobs = sampling_params.logprobs;
+  output.max_top_logprobs = sampling_params.max_top_logprobs;
+  output.beam_search_output.src_seq_idxes =
+      beam_tensors.out_token_index.reshape({-1});
+  output.beam_search_output.out_tokens =
+      beam_tensors.out_token_ids.reshape({-1});
+  output.beam_search_output.out_logprobs =
+      beam_tensors.acc_logprob.reshape({-1});
+  output.beam_sequence_group = beam_tensors.sequence_group;
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_two_stage_round_input(
+    ForwardInput& input,
+    int32_t round,
+    const torch::Tensor& top_tokens,
+    const BeamSearchTensors& beam_tensors) {
+#if defined(USE_NPU)
+// TODO: implement prepare_two_stage_round_input for NPU
+#elif defined(USE_CUDA)
+  auto& llm_rec_params = input.input_params.mutable_llmrec_params();
+  CHECK_EQ(FLAGS_enable_xattention_one_stage, false)
+      << "prepare_two_stage_round_input should only be called when "
+         "two-stage decode is enabled";
+
+  input.input_params.paged_kv_indices = torch::Tensor();
+  input.input_params.paged_kv_indptr = torch::Tensor();
+  input.input_params.paged_kv_last_page_len = torch::Tensor();
+  input.input_params.num_sequences =
+      llm_rec_params.batch_size *
+      std::max<int32_t>(llm_rec_params.beam_width, 1);
+
+  const int32_t previous_step = round - 1;
+  if (previous_step == 0) {
+    if (top_tokens.defined()) {
+      input.token_ids = top_tokens.reshape({-1});
+    }
+  } else if (previous_step > 0) {
+    input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+  }
+
+  if (!llm_rec_params.decode_positions_tensor_list.empty() &&
+      previous_step >= 0 &&
+      previous_step < static_cast<int32_t>(
+                          llm_rec_params.decode_positions_tensor_list.size())) {
+    input.positions =
+        llm_rec_params.decode_positions_tensor_list[previous_step];
+  }
+
+  input.input_params.batch_forward_type = BatchForwardType(2);
+  input.input_params.input_embedding = torch::Tensor();
+  cached_current_round_tensor_.fill_(previous_step);
+  llm_rec_params.current_round_tensor = cached_current_round_tensor_;
+
+  const int32_t batch_size = std::max<int32_t>(llm_rec_params.batch_size, 0);
+  const int32_t beam_width = std::max<int32_t>(llm_rec_params.beam_width, 1);
+  const int64_t total_beam = static_cast<int64_t>(batch_size) * beam_width;
+
+  CHECK_LE(total_beam, cached_two_stage_shared_lse_.size(0))
+      << "two-stage cache total_beam overflow";
+  CHECK_LE(batch_size + 1, cached_two_stage_q_cu_seq_lens_shared_.size(0))
+      << "two-stage q_cu_seq_lens cache overflow";
+
+  llm_rec_params.two_stage_shared_lse =
+      cached_two_stage_shared_lse_.slice(0, 0, total_beam);
+  llm_rec_params.two_stage_shared_o =
+      cached_two_stage_shared_o_.slice(0, 0, total_beam);
+  llm_rec_params.two_stage_unshared_lse =
+      cached_two_stage_unshared_lse_.slice(0, 0, total_beam);
+  llm_rec_params.two_stage_unshared_o =
+      cached_two_stage_unshared_o_.slice(0, 0, total_beam);
+  llm_rec_params.two_stage_q_cu_seq_lens_shared =
+      cached_two_stage_q_cu_seq_lens_shared_.slice(0, 0, batch_size + 1);
+  llm_rec_params.two_stage_paged_kv_indptr_expanded =
+      cached_two_stage_paged_kv_indptr_expanded_.slice(0, 0, total_beam + 1);
+  llm_rec_params.two_stage_paged_kv_indices_expanded =
+      cached_two_stage_paged_kv_indices_expanded_.slice(0, 0, total_beam);
+  llm_rec_params.two_stage_paged_kv_last_page_len_expanded =
+      cached_two_stage_paged_kv_last_page_len_expanded_.slice(0, 0, total_beam);
+
+  auto int_options = torch::TensorOptions()
+                         .dtype(torch::kInt32)
+                         .device(runtime_.worker.device());
+  auto q_cu_seq_lens_values =
+      torch::arange(0, (batch_size + 1) * beam_width, beam_width, int_options);
+  llm_rec_params.two_stage_q_cu_seq_lens_shared.copy_(q_cu_seq_lens_values,
+                                                      /*non_blocking=*/true);
+
+  auto paged_kv_indptr_values = torch::arange(total_beam + 1, int_options);
+  llm_rec_params.two_stage_paged_kv_indptr_expanded.copy_(
+      paged_kv_indptr_values, /*non_blocking=*/true);
+
+  if (input.input_params.block_tables.defined() &&
+      input.input_params.block_tables.numel() >= total_beam) {
+    llm_rec_params.two_stage_paged_kv_indices_expanded.copy_(
+        input.input_params.block_tables.view({-1}).slice(0, 0, total_beam),
+        /*non_blocking=*/true);
+  } else {
+    auto paged_kv_indices_values = torch::arange(total_beam, int_options);
+    llm_rec_params.two_stage_paged_kv_indices_expanded.copy_(
+        paged_kv_indices_values, /*non_blocking=*/true);
+  }
+
+  llm_rec_params.two_stage_paged_kv_last_page_len_expanded.fill_(previous_step +
+                                                                 1);
+  input.input_params.attn_metadata = nullptr;
+#endif
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_round_input_for_npu(
+    ForwardInput& input,
+    int32_t round,
+    const torch::Tensor& top_tokens,
+    const BeamSearchTensors& beam_tensors) {
+  auto& llm_rec_params = input.input_params.mutable_llmrec_params();
+  CHECK(cached_current_round_tensor_.defined());
+  CHECK(cached_beam_width_tensor_.defined());
+
+  cached_beam_width_tensor_.fill_(llm_rec_params.beam_width);
+  llm_rec_params.beam_width_tensor = cached_beam_width_tensor_;
+  cached_current_round_tensor_.fill_(round);
+  llm_rec_params.current_round_tensor = cached_current_round_tensor_;
+  input.input_params.attn_metadata = nullptr;
+
+  if (round > 0) {
+    if (round == 1) {
+      if (top_tokens.defined()) {
+        input.token_ids = top_tokens.reshape({-1});
+      }
+    } else {
+      input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+    }
+
+    const int32_t decode_step = round - 1;
+    if (!llm_rec_params.decode_positions_tensor_list.empty() &&
+        decode_step < static_cast<int32_t>(
+                          llm_rec_params.decode_positions_tensor_list.size())) {
+      input.positions =
+          llm_rec_params.decode_positions_tensor_list[decode_step];
+    }
+
+    input.input_params.batch_forward_type = BatchForwardType::DECODE;
+    input.input_params.input_embedding = torch::Tensor();
+  }
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_input_for_current_round(
+    ForwardInput& input,
+    const NextRoundInputResults& results,
+    int32_t round,
+    const torch::Tensor& top_tokens,
+    const BeamSearchTensors& beam_tensors) {
+#if defined(USE_CUDA)
+  if (FLAGS_enable_xattention_one_stage) {
+    input.input_params.paged_kv_indices = results.paged_kv_indices;
+    input.input_params.paged_kv_indptr = results.paged_kv_indptr;
+    input.input_params.paged_kv_last_page_len = results.paged_kv_last_page_len;
+    input.input_params.num_sequences =
+        input.input_params.paged_kv_last_page_len.numel();
+  } else {
+    prepare_two_stage_round_input(input, round, top_tokens, beam_tensors);
+    return;
+  }
+#endif
+  const int32_t previous_step = round - 1;
+  if (previous_step == 0) {
+    if (top_tokens.defined()) {
+      input.token_ids = top_tokens.reshape({-1});
+    }
+  } else if (previous_step > 0) {
+    input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+  }
+
+  auto& llm_rec_params = input.input_params.mutable_llmrec_params();
+  if (!llm_rec_params.decode_positions_tensor_list.empty() &&
+      previous_step >= 0 &&
+      previous_step < static_cast<int32_t>(
+                          llm_rec_params.decode_positions_tensor_list.size())) {
+    input.positions =
+        llm_rec_params.decode_positions_tensor_list[previous_step];
+  }
+
+  input.input_params.batch_forward_type = BatchForwardType(2);
+  input.input_params.input_embedding = torch::Tensor();
+  cached_current_round_tensor_.fill_(previous_step);
+  llm_rec_params.current_round_tensor = cached_current_round_tensor_;
+  input.input_params.attn_metadata = nullptr;
+}
+
+folly::SemiFuture<
+    RecWorkerImpl::LlmRecMultiRoundPipeline::NextRoundInputResults>
+RecWorkerImpl::LlmRecMultiRoundPipeline::compute_next_round_input_async(
+    const torch::Tensor& kv_seq_lens,
+    int32_t current_step,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t max_decode_step) {
+  folly::Promise<NextRoundInputResults> promise;
+  auto future = promise.getSemiFuture();
+
+#if defined(USE_CUDA)
+  if (FLAGS_enable_xattention_one_stage) {
+    auto full_kv_offsets = full_kv_cache_offsets_->full_kv_offsets;
+    auto full_kv_mask = full_kv_cache_offsets_->full_kv_mask;
+    auto full_kv_indices = full_kv_cache_offsets_->full_kv_indices;
+    auto unshared_full_kv_offsets = full_kv_cache_offsets_->unshared_offsets;
+    auto real_max_decode_step_ids = full_kv_cache_offsets_->max_decode_step_ids;
+    uint32_t unshared_kv_begin_offset = max_tokens_per_batch_;
+
+    threadpool_.schedule([=, this, promise = std::move(promise)]() mutable {
+      auto device = runtime_.worker.device();
+      auto int32_device_options =
+          torch::TensorOptions().dtype(torch::kInt32).device(device);
+      std::optional<std::shared_lock<std::shared_mutex>> lock_guard;
+      if (runtime_.worker.options_.enable_graph()) {
+        auto& replay_lock =
+            ::xllm::cuda::DeviceCaptureLock::get_instance().get_read_lock(
+                runtime_.worker.device_.index());
+        lock_guard.emplace(replay_lock);
+      }
+
+      c10::StreamGuard stream_guard =
+          runtime_.worker.prepare_stream_->set_stream_guard();
+      auto shared_kv_offsets = full_kv_offsets.slice(2, 0, max_token_per_req_)
+                                   .slice(0, 0, batch_size);
+
+      auto shared_kv_lens_each_batch = torch::diff(kv_seq_lens);
+      auto shared_kv_lens_each_batch_broadcast =
+          shared_kv_lens_each_batch.unsqueeze(1).unsqueeze(1);
+
+      auto shared_mask =
+          full_kv_mask.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+      shared_mask.copy_(shared_kv_offsets <
+                        shared_kv_lens_each_batch_broadcast);
+
+      auto kv_lens_batch_offsets = kv_seq_lens.slice(0, 0, -1);
+      auto kv_lens_batch_offsets_broadcast =
+          kv_lens_batch_offsets.unsqueeze(1).unsqueeze(1);
+
+      auto shared_kv_indices = full_kv_indices.slice(2, 0, max_token_per_req_)
+                                   .slice(0, 0, batch_size);
+      shared_kv_indices.copy_(kv_lens_batch_offsets_broadcast +
+                              shared_kv_offsets);
+
+      auto unshared_kv_offsets =
+          unshared_full_kv_offsets.slice(0, 0, batch_size);
+      int32_t unshared_kv_len = beam_width * max_decode_step;
+      auto unshared_kv_indices =
+          full_kv_indices
+              .slice(
+                  2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+              .slice(0, 0, batch_size);
+      unshared_kv_indices.copy_(unshared_kv_offsets + unshared_kv_begin_offset);
+
+      auto unshared_mask =
+          full_kv_mask
+              .slice(
+                  2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+              .slice(0, 0, batch_size);
+      auto real_max_decode_step_ids_slice =
+          real_max_decode_step_ids.slice(0, 0, batch_size);
+      unshared_mask.copy_(real_max_decode_step_ids_slice <= current_step);
+
+      unshared_kv_len = current_step + 1;
+
+      auto batch_beam_shared_kv_lens =
+          (shared_kv_lens_each_batch.unsqueeze(1).expand({-1, beam_width}) +
+           unshared_kv_len)
+              .flatten();
+      auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
+      auto paged_kv_indptr =
+          torch::cat({torch::zeros({1}, int32_device_options),
+                      cumsum_result.to(int32_device_options)},
+                     0);
+      auto paged_kv_indices = full_kv_indices.masked_select(full_kv_mask);
+      auto paged_kv_last_page_len =
+          torch::ones({batch_size * beam_width}, int32_device_options);
+      runtime_.worker.prepare_stream_->synchronize();
+
+      NextRoundInputResults results;
+      results.paged_kv_indices = paged_kv_indices;
+      results.paged_kv_indptr = paged_kv_indptr;
+      results.paged_kv_last_page_len = paged_kv_last_page_len;
+      promise.setValue(results);
+    });
+  } else {
+    promise.setValue(NextRoundInputResults{});
+  }
+#endif
+  return future;
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::
+    prepare_round_input_and_schedule_next(
+        ForwardInput& input,
+        int32_t round,
+        int32_t total_rounds,
+        int32_t batch_size,
+        int32_t beam_width,
+        int32_t max_decode_step,
+        const torch::Tensor& top_tokens,
+        const BeamSearchTensors& beam_tensors,
+        std::optional<folly::SemiFuture<NextRoundInputResults>>&
+            next_round_async_result) {
+  if (next_round_async_result.has_value()) {
+    auto results = std::move(next_round_async_result.value()).get();
+    prepare_input_for_current_round(
+        input, results, round, top_tokens, beam_tensors);
+    next_round_async_result.reset();
+  }
+
+  if (round < total_rounds - 1) {
+    next_round_async_result =
+        compute_next_round_input_async(input.input_params.kv_seq_lens,
+                                       round,
+                                       batch_size,
+                                       beam_width,
+                                       max_decode_step);
+  }
+}
+
+RecWorkerImpl::LlmRecMultiRoundPipeline::FullKvCacheOffsets::FullKvCacheOffsets(
+    LlmRecMultiRoundPipeline* multi_round_pipeline) {
+#if defined(USE_NPU)
+// TODO: implement FullKvCacheOffsets for NPU
+#elif defined(USE_CUDA)
+  auto device = multi_round_pipeline->runtime().worker.device();
+  auto int32_device_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+  int32_t max_decode_step = get_rec_multi_round_decode_rounds() - 1;
+  full_kv_offsets =
+      torch::arange(0,
+                    multi_round_pipeline->max_token_per_req_ + max_decode_step,
+                    int32_device_options)
+          .unsqueeze(0)
+          .expand({multi_round_pipeline->max_seqs_per_batch_, -1})
+          .unsqueeze(1)
+          .expand({-1, multi_round_pipeline->beam_width_, -1});
+  full_kv_mask =
+      torch::zeros({multi_round_pipeline->max_seqs_per_batch_,
+                    multi_round_pipeline->beam_width_,
+                    multi_round_pipeline->max_token_per_req_ + max_decode_step},
+                   int32_device_options)
+          .to(torch::kBool);
+  full_kv_indices = torch::zeros_like(full_kv_offsets);
+
+  auto batch_ids =
+      torch::arange(
+          0, multi_round_pipeline->max_seqs_per_batch_, int32_device_options)
+          .unsqueeze(1)
+          .unsqueeze(2)
+          .expand({-1, multi_round_pipeline->beam_width_, max_decode_step}) *
+      (multi_round_pipeline->beam_width_ * max_decode_step);
+
+  auto beams_ids =
+      torch::arange(0, multi_round_pipeline->beam_width_, int32_device_options)
+          .unsqueeze(0)
+          .unsqueeze(2)
+          .expand({multi_round_pipeline->max_seqs_per_batch_,
+                   -1,
+                   max_decode_step}) *
+      max_decode_step;
+
+  max_decode_step_ids = torch::arange(0, max_decode_step, int32_device_options)
+                            .unsqueeze(0)
+                            .unsqueeze(1)
+                            .expand({multi_round_pipeline->max_seqs_per_batch_,
+                                     multi_round_pipeline->beam_width_,
+                                     -1});
+  unshared_offsets = batch_ids + beams_ids + max_decode_step_ids;
+#endif
+}
+
+}  // namespace xllm

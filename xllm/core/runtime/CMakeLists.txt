@@ -54,6 +54,9 @@ cc_library(
     embed_worker_impl.cpp
     embed_vlm_worker_impl.cpp
     rec_worker_impl.cpp
+    rec_work_pipeline_base.cpp
+    llmrec_multiround_work_pipeline.cpp
+    llada_rec_work_pipeline.cpp
     mm_embed_vlm_worker_impl.cpp
     worker_client.cpp
     xservice_client.cpp
