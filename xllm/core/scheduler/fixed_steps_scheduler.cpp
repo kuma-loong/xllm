@@ -52,6 +52,14 @@ bool FixedStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(!request->sequences().empty());
 
   if (request_queue_.write(request)) {  //.get()
+    if (request->state().rec_type == RecType::kLLaDARec) {
+      const auto& sequence = request->sequences().front();
+      LOG(INFO) << "LLaDA scheduler accepted request"
+                << ", request_id=" << request->request_id()
+                << ", prompt_tokens=" << sequence->num_prompt_tokens()
+                << ", max_tokens="
+                << sequence->stopping_checker()->get_max_generated_tokens();
+    }
     // take over the ownership of the request
     // request.release();
     return true;
@@ -78,10 +86,14 @@ void FixedStepsScheduler::handle_prefill_requests(
   bool blocks_exhausted = false;
   const bool requires_kv_cache =
       scheduler_pipeline_ && scheduler_pipeline_->requires_kv_cache();
+  const bool apply_prefill_memory_threshold =
+      scheduler_pipeline_ == nullptr ||
+      scheduler_pipeline_->should_apply_prefill_memory_threshold();
   while (!waiting_priority_queue_.empty() && remaining_seq_budget > 0 &&
          remaining_token_budget > 0 &&
-         kv_cache_manager_->kv_cache_utilization() <
-             FLAGS_prefill_scheduling_memory_usage_threshold) {
+         (!apply_prefill_memory_threshold ||
+          kv_cache_manager_->kv_cache_utilization() <
+              FLAGS_prefill_scheduling_memory_usage_threshold)) {
     std::shared_ptr<Request> request(waiting_priority_queue_.top());
     if (request->finished() || request->cancelled()) {
       if (requires_kv_cache) {
@@ -169,11 +181,22 @@ void FixedStepsScheduler::handle_prefill_requests(
 
   if (running_sequences_.empty() && !waiting_priority_queue_.empty() &&
       running_queue_->empty()) {
+    const std::shared_ptr<Request>& request = waiting_priority_queue_.top();
+    const auto& sequence = request->sequences().front();
     LOG(ERROR)
         << "Request prompt is too long, no enough budget/memory to schedule "
-           "a single sequence.";
+           "a single sequence. rec_type="
+        << static_cast<int32_t>(request->state().rec_type)
+        << ", prompt_tokens=" << sequence->num_prompt_tokens()
+        << ", max_tokens="
+        << sequence->stopping_checker()->get_max_generated_tokens()
+        << ", remaining_token_budget=" << remaining_token_budget
+        << ", remaining_seq_budget=" << remaining_seq_budget
+        << ", kv_cache_utilization="
+        << kv_cache_manager_->kv_cache_utilization()
+        << ", apply_prefill_memory_threshold=" << apply_prefill_memory_threshold
+        << ", requires_kv_cache=" << requires_kv_cache;
     // no enough memory to schedule single sequence, just finish the request
-    std::shared_ptr<Request> request(waiting_priority_queue_.top());
     waiting_priority_queue_.pop();
     // block_manager_->release_blocks_for(request.get());
     response_processor_->process_failed_request(
@@ -199,6 +222,14 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
     }
 
     if (request->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
+      if (request->state().rec_type == RecType::kLLaDARec) {
+        const auto& sequence = request->sequences().front();
+        LOG(INFO) << "LLaDA scheduler dequeued request"
+                  << ", request_id=" << request->request_id()
+                  << ", prompt_tokens=" << sequence->num_prompt_tokens()
+                  << ", max_tokens="
+                  << sequence->stopping_checker()->get_max_generated_tokens();
+      }
       waiting_priority_queue_.push(request);
     } else {
       // request from prefill instance in disagge pd mode.
@@ -274,6 +305,17 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
         running_sequences_,
         running_sequences_budgets_,
         kv_cache_manager_->get_swap_block_transfer_infos());
+  }
+
+  if (!batches.empty() && !batches[0].empty() && !running_requests_.empty() &&
+      running_requests_.front()->state().rec_type == RecType::kLLaDARec) {
+    LOG(INFO) << "LLaDA scheduler prepared batch"
+              << ", num_requests=" << running_requests_.size()
+              << ", num_sequences=" << running_sequences_.size()
+              << ", first_budget="
+              << (running_sequences_budgets_.empty()
+                      ? 0
+                      : running_sequences_budgets_.front());
   }
 
   // update metrics before returning
@@ -352,7 +394,22 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
                      batches = std::move(result.batches),
                      requests = std::move(result.requests),
                      sequences = std::move(result.sequences)]() mutable {
+      const bool is_llada_batch =
+          !requests.empty() && requests.front() != nullptr &&
+          requests.front()->state().rec_type == RecType::kLLaDARec;
+      if (is_llada_batch) {
+        LOG(INFO) << "LLaDA scheduler before engine step"
+                  << ", num_batches=" << batches.size()
+                  << ", num_requests=" << requests.size()
+                  << ", num_sequences=" << sequences.size();
+      }
       engine_->step(batches);
+      if (is_llada_batch) {
+        LOG(INFO) << "LLaDA scheduler after engine step"
+                  << ", num_batches=" << batches.size()
+                  << ", num_requests=" << requests.size()
+                  << ", num_sequences=" << sequences.size();
+      }
       kv_cache_manager_->reset_transfer_infos();
 
       // After step completes, check and process finished/cancelled requests
@@ -428,6 +485,17 @@ std::vector<Batch> FixedStepsScheduler::OneRecSchedulerPipeline::create_batches(
 }
 
 std::vector<Batch>
+FixedStepsScheduler::LLaDARecSchedulerPipeline::create_batches(
+    FixedStepsScheduler& scheduler,
+    BatchFactory* batch_factory) {
+  return batch_factory->create_rec_batches(
+      scheduler.running_requests_,
+      scheduler.running_sequences_,
+      scheduler.running_sequences_budgets_,
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
+}
+
+std::vector<Batch>
 FixedStepsScheduler::RecMultiRoundSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
     BatchFactory* batch_factory) {
@@ -446,6 +514,9 @@ FixedStepsScheduler::create_scheduler_pipeline(RecType rec_type,
   }
   if (rec_type == RecType::kLlmRec) {
     return std::make_unique<LlmRecSchedulerPipeline>();
+  }
+  if (rec_type == RecType::kLLaDARec) {
+    return std::make_unique<LLaDARecSchedulerPipeline>();
   }
   return std::make_unique<OneRecSchedulerPipeline>();
 }

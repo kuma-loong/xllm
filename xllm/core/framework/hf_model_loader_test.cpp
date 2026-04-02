@@ -181,6 +181,29 @@ TEST(HFModelLoaderTest, LLaDARecModelKindAndPipelineType) {
   EXPECT_EQ(ModelRegistry::get_model_backend("llada2_moe"), "rec");
 }
 
+TEST(HFModelLoaderTest, LLaDARuntimeConfigDefaultsAreValid) {
+  LLaDARuntimeConfig config = get_llada_runtime_config();
+  std::string error_message;
+  EXPECT_TRUE(validate_llada_runtime_config(config, -1, &error_message))
+      << error_message;
+}
+
+TEST(HFModelLoaderTest, LLaDARuntimeConfigRejectsInvalidRanges) {
+  LLaDARuntimeConfig config = get_llada_runtime_config();
+  std::string error_message;
+
+  config.block_length = 0;
+  EXPECT_FALSE(validate_llada_runtime_config(config, -1, &error_message));
+
+  config = get_llada_runtime_config();
+  config.threshold = 1.5;
+  EXPECT_FALSE(validate_llada_runtime_config(config, -1, &error_message));
+
+  config = get_llada_runtime_config();
+  config.mask_id = 42;
+  EXPECT_FALSE(validate_llada_runtime_config(config, 42, &error_message));
+}
+
 TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {
   auto loader = ModelRegistry::get_model_args_loader("llada2_moe");
   ASSERT_TRUE(loader != nullptr);

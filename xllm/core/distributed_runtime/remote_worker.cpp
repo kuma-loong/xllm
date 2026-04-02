@@ -171,9 +171,20 @@ RemoteWorker::estimate_kv_cache_capacity_async() {
 
 folly::SemiFuture<std::optional<ForwardOutput>> RemoteWorker::step_async(
     const ForwardInput& input) {
-  LOG(FATAL) << "RemoteWorker Method step_async with "
-                "ForwardInput param is UnImplemented.";
-  return folly::makeSemiFuture(std::optional<ForwardOutput>(std::nullopt));
+  folly::Promise<std::optional<ForwardOutput>> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, input = std::move(input), promise = std::move(promise)]() mutable {
+        ForwardOutput output;
+        if (!channel_->execute_model(input, &output)) {
+          LOG(ERROR) << "RemoteWorker execute_model failed, global_rank_="
+                     << global_rank_;
+          promise.setValue(std::nullopt);
+          return;
+        }
+        promise.setValue(std::move(output));
+      });
+  return future;
 }
 
 folly::SemiFuture<std::optional<RawForwardOutput>> RemoteWorker::step_async(

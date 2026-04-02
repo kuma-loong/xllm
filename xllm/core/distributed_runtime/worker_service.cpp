@@ -628,6 +628,18 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         proto_to_forward_input(
             pb_forward_input, forward_input, options_.num_decoding_tokens());
 
+        if (forward_input.input_params.has_llada_params()) {
+          auto future = worker_->step_async(forward_input);
+          auto forward_outputs = std::move(future).get();
+          if (forward_outputs &&
+              forward_outputs.value().raw_output.has_value()) {
+            raw_forward_output_to_proto(
+                forward_outputs.value().raw_output.value(), pb_forward_output);
+          }
+          COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
+          return;
+        }
+
         // model output
         torch::Tensor next_tokens;
         torch::Tensor logprobs;

@@ -228,4 +228,21 @@ TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {
   EXPECT_NO_THROW(scheduler.step(absl::Milliseconds(500)));
 }
 
+TEST(FixedStepsSchedulerTest, PrepareBatchLLaDASkipsPlaceholderKvThreshold) {
+  FLAGS_enable_prefix_cache = false;
+  FLAGS_prefill_scheduling_memory_usage_threshold = 0.95;
+  auto engine = std::make_unique<FakeEngine>(1, 32);
+  auto opt = CreateOptions(10240, 1);
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  auto requests = GenRequests({19}, {32}, RecType::kLLaDARec);
+  scheduler.add_request(requests[0]);
+  ContinuousScheduler* base = &scheduler;
+  std::vector<Batch> batches = base->prepare_batch_test();
+  EXPECT_FALSE(batches.empty());
+  EXPECT_FALSE(batches[0].empty());
+  EXPECT_EQ(base->get_running_requests().size(), 1u);
+  EXPECT_EQ(batches[0].get_allowed_max_tokens().size(), 1u);
+  EXPECT_EQ(batches[0].get_allowed_max_tokens()[0], 19u);
+}
+
 }  // namespace xllm

@@ -338,7 +338,9 @@ bool RecEngine::init_model() {
     threadpool_ = std::make_unique<ThreadPool>(16);
   }
   // Compute KV cache config (shared logic)
-  const int32_t world_size = static_cast<int32_t>(options_.devices().size());
+  const int32_t world_size =
+      worker_clients_.empty() ? static_cast<int32_t>(options_.devices().size())
+                              : static_cast<int32_t>(worker_clients_.size());
   const int64_t n_heads = args_.n_heads();
   const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
   n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
@@ -455,6 +457,21 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
 }
 
 ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
+  bool has_llada_batch = false;
+  if (!batches.empty()) {
+    for (auto* sequence : batches.front().get_sequences()) {
+      if (sequence != nullptr && sequence->rec_type() == RecType::kLLaDARec) {
+        has_llada_batch = true;
+        break;
+      }
+    }
+  }
+  if (has_llada_batch) {
+    LOG(INFO) << "LLaDA RecEngine::step entered"
+              << ", num_batches=" << batches.size() << ", pipeline_type="
+              << rec_pipeline_type_to_string(
+                     get_rec_pipeline_type(rec_model_kind_));
+  }
   return pipeline_->step(batches);
 }
 
@@ -868,14 +885,54 @@ RecEngine::RecMultiRoundEnginePipeline::RecMultiRoundEnginePipeline(
 RecEngine::LLaDARecEnginePipeline::LLaDARecEnginePipeline(RecEngine& engine)
     : RecEnginePipeline(engine) {}
 
-void RecEngine::LLaDARecEnginePipeline::setup_workers() {}
+void RecEngine::LLaDARecEnginePipeline::setup_workers() {
+  if (engine_.options_.nnodes() <= 1) {
+    return;
+  }
+  if (!engine_.dist_manager_) {
+    engine_.dist_manager_ = std::make_shared<DistManager>(engine_.options_);
+  }
+  engine_.worker_clients_ = engine_.dist_manager_->get_worker_clients();
+  engine_.dp_size_ = engine_.options_.dp_size();
+  engine_.worker_clients_num_ = engine_.worker_clients_.size();
+  engine_.dp_local_tp_size_ = engine_.worker_clients_num_ / engine_.dp_size_;
+}
 
 void RecEngine::LLaDARecEnginePipeline::process_group_test() {
+  if (!engine_.worker_clients_.empty()) {
+#if !defined(USE_NPU)
+    std::vector<folly::SemiFuture<folly::Unit>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.emplace_back(worker->process_group_test_async());
+    }
+    const int timeout_seconds = util::get_process_group_test_timeout_seconds();
+    folly::collectAll(futures)
+        .within(std::chrono::seconds(timeout_seconds))
+        .get();
+#endif
+    return;
+  }
   process_local_worker_group_test(engine_.workers_);
 }
 
 bool RecEngine::LLaDARecEnginePipeline::init_model_workers(
     const std::string& model_path) {
+  if (!engine_.worker_clients_.empty()) {
+    std::vector<folly::SemiFuture<bool>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.push_back(worker->init_model_async(
+          model_path, FLAGS_random_seed, MasterStatus::WAKEUP));
+    }
+    auto results = folly::collectAll(futures).get();
+    for (const auto& result : results) {
+      if (!result.value()) {
+        return false;
+      }
+    }
+    return true;
+  }
   return init_local_workers(
       engine_.options_,
       model_path,
@@ -887,6 +944,41 @@ bool RecEngine::LLaDARecEnginePipeline::init_model_workers(
 }
 
 int64_t RecEngine::LLaDARecEnginePipeline::estimate_min_available_memory() {
+  if (!engine_.worker_clients_.empty()) {
+    const int64_t max_cache_size = engine_.options_.max_cache_size();
+    const double max_memory_utilization =
+        engine_.options_.max_memory_utilization();
+    std::vector<folly::SemiFuture<std::tuple<int64_t, int64_t>>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.push_back(worker->estimate_kv_cache_capacity_async());
+    }
+
+    int64_t cache_size_in_bytes = std::numeric_limits<int64_t>::max();
+    auto results = folly::collectAll(futures).get();
+    for (size_t i = 0; i < results.size(); ++i) {
+      if (!results[i].hasValue()) {
+        LOG(ERROR) << "Failed to profile memory usage for worker: " << i;
+        continue;
+      }
+      auto [available_memory, total_memory] = results[i].value();
+      LOG(INFO) << "llada worker #" << i
+                << ": available memory: " << readable_size(available_memory)
+                << ", total memory: " << readable_size(total_memory)
+                << ". Using max_memory_utilization: " << max_memory_utilization
+                << ", max_cache_size: " << readable_size(max_cache_size);
+      if (max_memory_utilization < 1.0) {
+        const int64_t buffer_memory =
+            total_memory * (1.0 - max_memory_utilization);
+        available_memory -= buffer_memory;
+      }
+      if (max_cache_size > 0) {
+        available_memory = std::min(available_memory, max_cache_size);
+      }
+      cache_size_in_bytes = std::min(cache_size_in_bytes, available_memory);
+    }
+    return cache_size_in_bytes;
+  }
   return estimate_local_worker_available_memory(
       engine_.options_, engine_.workers_, "llada worker");
 }
@@ -898,12 +990,26 @@ bool RecEngine::LLaDARecEnginePipeline::allocate_kv_cache(
   LOG(INFO) << "LLaDA placeholder KV cache shapes"
             << ", k_shape=[" << kv_cache_shape[0] << "]"
             << ", v_shape=[" << kv_cache_shape[1] << "]";
+  if (!engine_.worker_clients_.empty()) {
+    std::vector<folly::SemiFuture<bool>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+    }
+    auto results = folly::collectAll(futures).get();
+    for (const auto& result : results) {
+      if (!result.value()) {
+        return false;
+      }
+    }
+    return true;
+  }
   return allocate_local_worker_kv_cache(engine_.workers_, kv_cache_shape);
 }
 
 ForwardOutput RecEngine::LLaDARecEnginePipeline::step(
     std::vector<Batch>& batches) {
-  if (engine_.workers_.empty()) {
+  if (engine_.workers_.empty() && engine_.worker_clients_.empty()) {
     return {};
   }
 
@@ -914,10 +1020,19 @@ ForwardOutput RecEngine::LLaDARecEnginePipeline::step(
             << ", pipeline_type="
             << rec_pipeline_type_to_string(
                    get_rec_pipeline_type(engine_.rec_model_kind_))
-            << ", tp_size=" << engine_.workers_.size()
+            << ", tp_size=" << num_workers()
             << ", dp_batches=" << batches.size();
   Timer timer;
-  auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
+  ForwardInput forward_inputs;
+  if (!engine_.worker_clients_.empty()) {
+    forward_inputs = batches[0].prepare_rec_forward_input(
+        engine_.options_.num_decoding_tokens(),
+        /*min_decoding_batch_size=*/0,
+        engine_.args_,
+        engine_.threadpool_.get());
+  } else {
+    forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
+  }
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
   if (!forward_inputs.token_ids.defined()) {
     return {};
@@ -941,15 +1056,52 @@ ForwardOutput RecEngine::LLaDARecEnginePipeline::step(
 
 std::vector<int64_t>
 RecEngine::LLaDARecEnginePipeline::get_active_activation_memory() const {
+  if (!engine_.worker_clients_.empty()) {
+    std::vector<folly::SemiFuture<int64_t>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.push_back(worker->get_active_activation_memory_async());
+    }
+    auto results = folly::collectAll(futures).get();
+    std::vector<int64_t> active_activation_memories;
+    active_activation_memories.reserve(results.size());
+    for (auto& result : results) {
+      active_activation_memories.push_back(result.value());
+    }
+    return active_activation_memories;
+  }
   return get_local_worker_active_activation_memory(engine_.workers_);
 }
 
 size_t RecEngine::LLaDARecEnginePipeline::num_workers() const {
+  if (!engine_.worker_clients_.empty()) {
+    return engine_.worker_clients_.size();
+  }
   return engine_.workers_.size();
 }
 
 ForwardOutput RecEngine::LLaDARecEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
+  if (!engine_.worker_clients_.empty()) {
+    std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
+    futures.reserve(engine_.worker_clients_.size());
+    for (auto& worker : engine_.worker_clients_) {
+      futures.emplace_back(worker->step_async(model_inputs));
+    }
+    auto results = folly::collectAll(futures).get();
+    for (size_t i = 0; i < results.size(); ++i) {
+      if (results[i].hasException()) {
+        LOG(FATAL) << "Worker " << i << " failed with exception: "
+                   << results[i].exception().what();
+      }
+      CHECK(results[i].value().has_value())
+          << "Worker " << i
+          << " failed to execute model and returned no output.";
+    }
+    const auto& forward_output = results.front().value();
+    CHECK(forward_output.has_value()) << "Failed to execute model";
+    return forward_output.value();
+  }
   return get_local_worker_forward_output(engine_.workers_, model_inputs);
 }
 

@@ -129,8 +129,8 @@ ForwardInput LLaDARecBatchInputBuilder::build_rec_forward_input(
   input.input_params.batch_id = batch_id_;
   auto& llada_params = input.input_params.mutable_llada_params();
   llada_params.prompt_length = prompt_length;
-  llada_params.max_generated_tokens =
-      static_cast<int32_t>(allowed_max_tokens_.front());
+  llada_params.max_generated_tokens = static_cast<int32_t>(
+      sequence->stopping_checker()->get_max_generated_tokens());
   return input;
 }
 

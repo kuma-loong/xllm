@@ -36,7 +36,7 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
     embed_tokens_ =
         register_module("word_embeddings", layer::WordEmbedding(context));
     norm_ = register_module(
-        "final_layernorm",
+        "norm",
         layer::RMSNorm(
             model_args_.hidden_size(), model_args_.rms_norm_eps(), options_));
     blocks_ = register_module("layers", torch::nn::ModuleList());
@@ -112,7 +112,10 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
       }
     }
 
-    auto norm_state_dict = state_dict.get_dict_with_prefix("final_layernorm.");
+    auto norm_state_dict = state_dict.get_dict_with_prefix("norm.");
+    if (norm_state_dict.size() == 0) {
+      norm_state_dict = state_dict.get_dict_with_prefix("final_layernorm.");
+    }
     if (norm_state_dict.size() > 0) {
       norm_->load_state_dict(norm_state_dict);
       norm_weight_is_loaded_ = norm_weight_is_loaded_ ||
@@ -128,7 +131,7 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
                                         ".");
     }
     CHECK(norm_weight_is_loaded_)
-        << "weight is not loaded for " << prefix + "final_layernorm.weight";
+        << "weight is not loaded for " << prefix + "norm.weight";
   }
 
   layer::WordEmbedding get_word_embedding() { return embed_tokens_; }

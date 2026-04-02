@@ -241,6 +241,8 @@ message ForwardInput {
   repeated int32 dp_is_decode = 42;
   repeated int32 kv_cache_tokens_nums = 43;
   repeated string request_ids = 44;
+  int32 llada_prompt_length = 45;
+  int32 llada_max_generated_tokens = 46;
 }
 
  message BatchedForwardInputs {

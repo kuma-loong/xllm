@@ -90,6 +90,8 @@ class CommChannel {
       const RawForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
 
+  virtual bool execute_model(const ForwardInput& input, ForwardOutput* output);
+
   virtual bool process_group_test();
 
   virtual bool allocate_kv_cache_with_transfer(

@@ -622,6 +622,11 @@ RecMaster::RecMaster(const Options& options)
   if (rec_type_ == RecType::kLLaDARec) {
     const auto devices =
         DeviceNameUtils::parse_devices(options_.devices().value_or("auto"));
+    if (devices.empty()) {
+      init_error_message_ = "LLaDA requires at least one local device.";
+      LOG(ERROR) << init_error_message_;
+      return;
+    }
     LLaDARuntimeConfig llada_runtime_config;
     if (!load_llada_runtime_config(model_args_.eos_token_id(),
                                    &llada_runtime_config,
@@ -636,7 +641,7 @@ RecMaster::RecMaster(const Options& options)
               << ", pipeline_type="
               << rec_pipeline_type_to_string(get_rec_pipeline_type(
                      get_rec_model_kind(model_args_.model_type())))
-              << ", tp_size=" << devices.size() << ", "
+              << ", tp_size=" << devices.size() * options_.nnodes() << ", "
               << llada_runtime_config_to_string(llada_runtime_config);
   }
 
@@ -705,6 +710,12 @@ void RecMaster::run() {
     return;
   }
   running_.store(true, std::memory_order_relaxed);
+  LOG(INFO) << "RecMaster loop thread starting"
+            << ", rec_type=" << static_cast<int32_t>(rec_type_)
+            << ", max_tokens_per_batch=" << options_.max_tokens_per_batch()
+            << ", max_seqs_per_batch=" << options_.max_seqs_per_batch()
+            << ", rec_worker_max_concurrency="
+            << options_.rec_worker_max_concurrency();
   loop_thread_ = std::thread([this]() {
     const auto timeout = absl::Milliseconds(5);
     while (!stopped_.load(std::memory_order_relaxed)) {
@@ -875,9 +886,24 @@ void RecMaster::schedule_request(RequestParams sp,
       return;
     }
 
+    if (request->state().rec_type == RecType::kLLaDARec) {
+      const auto& sequence = request->sequences().front();
+      LOG(INFO) << "LLaDA request built"
+                << ", request_id=" << request->request_id()
+                << ", prompt_tokens=" << sequence->num_prompt_tokens()
+                << ", max_tokens="
+                << sequence->stopping_checker()->get_max_generated_tokens();
+    }
+
     if (!scheduler_->add_request(request)) {
       CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
                           "No available resources to schedule request");
+      return;
+    }
+
+    if (request->state().rec_type == RecType::kLLaDARec) {
+      LOG(INFO) << "LLaDA request enqueued"
+                << ", request_id=" << request->request_id();
     }
   });
 }

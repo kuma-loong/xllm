@@ -24,12 +24,11 @@ limitations under the License.
 #include <vector>
 
 #include "common/rec_model_utils.h"
+#include "framework/sampling/rec_sampler.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/threadpool.h"
 
 namespace xllm {
-
-class RecSampler;
 
 class RecWorkerImpl : public LLMWorkerImpl {
   friend class RecWorkPipeline;
@@ -289,7 +288,8 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                        int32_t block_length) const;
     torch::Tensor initialize_tokens(const ForwardInput& input,
                                     int32_t prompt_length,
-                                    int32_t total_length) const;
+                                    int32_t total_length,
+                                    int32_t mask_token_id) const;
     int64_t finalize_answer_length(const torch::Tensor& generated_tokens,
                                    int32_t eos_token_id,
                                    int32_t mask_token_id) const;

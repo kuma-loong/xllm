@@ -364,7 +364,164 @@ void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
     proto_to_mmdata(pb_forward_input->mm_data(), &input_params.mm_data);
   }
 
+  if (pb_forward_input->llada_prompt_length() > 0 &&
+      pb_forward_input->llada_max_generated_tokens() > 0) {
+    auto& llada_params = input_params.mutable_llada_params();
+    llada_params.prompt_length = pb_forward_input->llada_prompt_length();
+    llada_params.max_generated_tokens =
+        pb_forward_input->llada_max_generated_tokens();
+  }
+
   COUNTER_ADD(proto_latency_seconds_proto2i, timer.elapsed_seconds());
+}
+
+void forward_input_to_proto(const ForwardInput& inputs,
+                            proto::ForwardInput* pb_forward_input) {
+  Timer timer;
+
+  auto token_ids = inputs.token_ids.contiguous().to(torch::kCPU);
+  auto positions = inputs.positions.contiguous().to(torch::kCPU);
+  CHECK_EQ(token_ids.scalar_type(), torch::kInt32);
+  CHECK_EQ(positions.scalar_type(), torch::kInt32);
+
+  Slice<int32_t> token_ids_slice = {token_ids.data_ptr<int32_t>(),
+                                    static_cast<size_t>(token_ids.numel())};
+  Slice<int32_t> positions_slice = {positions.data_ptr<int32_t>(),
+                                    static_cast<size_t>(positions.numel())};
+  ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_flatten_tokens_vec(),
+                      token_ids_slice);
+  ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_flatten_positions_vec(),
+                      positions_slice);
+
+  pb_forward_input->set_batch_forward_type(
+      inputs.input_params.batch_forward_type.value());
+  pb_forward_input->set_num_sequences(inputs.input_params.num_sequences);
+  pb_forward_input->set_max_seq_len(inputs.input_params.kv_max_seq_len);
+  pb_forward_input->set_q_max_seq_len(inputs.input_params.q_max_seq_len);
+  pb_forward_input->set_batch_id(inputs.input_params.batch_id);
+
+  if (inputs.input_params.kv_seq_lens.defined()) {
+    auto kv_seq_lens = inputs.input_params.kv_seq_lens.contiguous().to(
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> kv_seq_lens_slice = {
+        kv_seq_lens.data_ptr<int32_t>(),
+        static_cast<size_t>(kv_seq_lens.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_seq_lens(),
+                        kv_seq_lens_slice);
+  }
+  if (inputs.input_params.q_seq_lens.defined()) {
+    auto q_seq_lens = inputs.input_params.q_seq_lens.contiguous().to(
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> q_seq_lens_slice = {q_seq_lens.data_ptr<int32_t>(),
+                                       static_cast<size_t>(q_seq_lens.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_q_seq_lens(),
+                        q_seq_lens_slice);
+  }
+  if (inputs.input_params.q_cu_seq_lens.defined()) {
+    auto q_cu_seq_lens = inputs.input_params.q_cu_seq_lens.contiguous().to(
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> q_cu_seq_lens_slice = {
+        q_cu_seq_lens.data_ptr<int32_t>(),
+        static_cast<size_t>(q_cu_seq_lens.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_q_cu_seq_lens(),
+                        q_cu_seq_lens_slice);
+  }
+  if (inputs.input_params.kv_cache_tokens_nums.defined()) {
+    auto kv_cache_tokens_nums =
+        inputs.input_params.kv_cache_tokens_nums.contiguous().to(
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> kv_cache_tokens_nums_slice = {
+        kv_cache_tokens_nums.data_ptr<int32_t>(),
+        static_cast<size_t>(kv_cache_tokens_nums.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_kv_cache_tokens_nums(),
+                        kv_cache_tokens_nums_slice);
+  }
+
+  if (inputs.sampling_params.selected_token_idxes.defined()) {
+    auto selected_token_idxes =
+        inputs.sampling_params.selected_token_idxes.contiguous().to(
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> selected_token_idxes_slice = {
+        selected_token_idxes.data_ptr<int32_t>(),
+        static_cast<size_t>(selected_token_idxes.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_selected_token_idxes(),
+                        selected_token_idxes_slice);
+
+    const int64_t num_sampling_params = selected_token_idxes.numel();
+    pb_forward_input->mutable_sampling_params()->Reserve(num_sampling_params);
+    for (int64_t index = 0; index < num_sampling_params; ++index) {
+      proto::RequestSamplingParam pb_sampling_param;
+      pb_sampling_param.set_frequency_penalty(0.0);
+      pb_sampling_param.set_presence_penalty(0.0);
+      pb_sampling_param.set_repetition_penalty(1.0);
+      pb_sampling_param.set_temperature(0.0);
+      pb_sampling_param.set_top_p(1.0);
+      pb_sampling_param.set_top_k(-1);
+      if (inputs.sampling_params.frequency_penalties.defined() &&
+          inputs.sampling_params.frequency_penalties.numel() > index) {
+        pb_sampling_param.set_frequency_penalty(
+            inputs.sampling_params.frequency_penalties[index].item<float>());
+      }
+      if (inputs.sampling_params.presence_penalties.defined() &&
+          inputs.sampling_params.presence_penalties.numel() > index) {
+        pb_sampling_param.set_presence_penalty(
+            inputs.sampling_params.presence_penalties[index].item<float>());
+      }
+      if (inputs.sampling_params.repetition_penalties.defined() &&
+          inputs.sampling_params.repetition_penalties.numel() > index) {
+        pb_sampling_param.set_repetition_penalty(
+            inputs.sampling_params.repetition_penalties[index].item<float>());
+      }
+      if (inputs.sampling_params.temperatures.defined() &&
+          inputs.sampling_params.temperatures.numel() > index) {
+        pb_sampling_param.set_temperature(
+            inputs.sampling_params.temperatures[index].item<float>());
+      }
+      if (inputs.sampling_params.top_p.defined() &&
+          inputs.sampling_params.top_p.numel() > index) {
+        pb_sampling_param.set_top_p(
+            inputs.sampling_params.top_p[index].item<float>());
+      }
+      if (inputs.sampling_params.top_k.defined() &&
+          inputs.sampling_params.top_k.numel() > index) {
+        pb_sampling_param.set_top_k(
+            inputs.sampling_params.top_k[index].item<int64_t>());
+      }
+      pb_sampling_param.set_logprobs(inputs.sampling_params.logprobs);
+      pb_sampling_param.set_top_logprobs(
+          inputs.sampling_params.max_top_logprobs);
+      if (inputs.sampling_params.do_sample.defined() &&
+          inputs.sampling_params.do_sample.numel() > index) {
+        pb_sampling_param.set_do_sample(
+            inputs.sampling_params.do_sample[index].item<bool>());
+      } else {
+        pb_sampling_param.set_do_sample(
+            inputs.sampling_params.all_random_sample);
+      }
+      pb_sampling_param.set_is_embeddings(inputs.sampling_params.is_embeddings);
+      pb_sampling_param.set_beam_width(
+          inputs.sampling_params.use_beam_search ? 1 : 0);
+      *pb_forward_input->mutable_sampling_params()->Add() = pb_sampling_param;
+    }
+  }
+
+  if (inputs.sampling_params.sample_idxes.defined()) {
+    auto sample_idxes = inputs.sampling_params.sample_idxes.contiguous().to(
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+    Slice<int32_t> sample_idxes_slice = {
+        sample_idxes.data_ptr<int32_t>(),
+        static_cast<size_t>(sample_idxes.numel())};
+    ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_sample_idxes(),
+                        sample_idxes_slice);
+  }
+
+  if (const auto* llada_params = inputs.input_params.llada_params()) {
+    pb_forward_input->set_llada_prompt_length(llada_params->prompt_length);
+    pb_forward_input->set_llada_max_generated_tokens(
+        llada_params->max_generated_tokens);
+  }
+
+  COUNTER_ADD(proto_latency_seconds_i2proto, timer.elapsed_seconds());
 }
 
 void forward_input_to_proto(const RawForwardInput& inputs,
@@ -585,6 +742,43 @@ void proto_to_forward_output(const proto::ForwardOutput& pb_output,
   }
 
   COUNTER_ADD(proto_latency_seconds_proto2o, timer.elapsed_seconds());
+}
+
+void raw_forward_output_to_proto(const RawForwardOutput& raw_forward_output,
+                                 proto::ForwardOutput* pb_forward_output) {
+  Timer timer;
+  pb_forward_output->mutable_outputs()->Reserve(
+      raw_forward_output.outputs.size());
+  for (const auto& output : raw_forward_output.outputs) {
+    auto* pb_seq_out = pb_forward_output->mutable_outputs()->Add();
+    pb_seq_out->mutable_tokens()->Reserve(output.tokens.size());
+    for (const auto& token : output.tokens) {
+      auto* pb_token = pb_seq_out->mutable_tokens()->Add();
+      pb_token->set_id(token.id);
+      if (token.logprob.has_value()) {
+        pb_token->set_logprob(token.logprob.value());
+      } else {
+        pb_token->set_empty(true);
+      }
+      ADD_VECTOR_TO_PROTO(pb_token->mutable_top_tokens(), token.top_tokens);
+      ADD_VECTOR_TO_PROTO(pb_token->mutable_top_logprobs(), token.top_logprobs);
+      ADD_VECTOR_TO_PROTO(pb_token->mutable_embeddings()->mutable_vals(),
+                          token.embeddings);
+    }
+  }
+
+  ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_expert_load_data(),
+                      raw_forward_output.expert_load_data);
+  pb_forward_output->set_prepared_layer_id(
+      raw_forward_output.prepared_layer_id);
+  ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_src_seq_idxes(),
+                      raw_forward_output.src_seq_idxes);
+  ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_out_tokens(),
+                      raw_forward_output.out_tokens);
+  ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_out_logprobs(),
+                      raw_forward_output.out_logprobs);
+
+  COUNTER_ADD(proto_latency_seconds_o2proto, timer.elapsed_seconds());
 }
 
 void forward_output_to_proto(const torch::Tensor& next_tokens,

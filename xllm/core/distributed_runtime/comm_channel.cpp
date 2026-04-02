@@ -317,6 +317,25 @@ void CommChannel::execute_model_async(
   execute_model_with_brpc(input, promise);
 }
 
+bool CommChannel::execute_model(const ForwardInput& input,
+                                ForwardOutput* output) {
+  proto::ForwardInput pb_forward_input;
+  forward_input_to_proto(input, &pb_forward_input);
+
+  proto::ForwardOutput pb_forward_output;
+  brpc::Controller cntl;
+  stub_->ExecuteModel(&cntl, &pb_forward_input, &pb_forward_output, nullptr);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "execute_model failed: " << cntl.ErrorText();
+    return false;
+  }
+
+  RawForwardOutput raw_forward_output;
+  proto_to_forward_output(pb_forward_output, raw_forward_output);
+  output->raw_output = std::move(raw_forward_output);
+  return true;
+}
+
 bool CommChannel::process_group_test() {
   proto::Empty req;
   proto::Status s;

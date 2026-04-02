@@ -28,11 +28,17 @@ void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
                             ForwardInput& forward_inputs,
                             int64_t num_decoding_tokens);
 
+void forward_input_to_proto(const ForwardInput& inputs,
+                            proto::ForwardInput* pb_forward_input);
+
 void forward_input_to_proto(const RawForwardInput& inputs,
                             proto::ForwardInput* pb_forward_input);
 
 void proto_to_forward_output(const proto::ForwardOutput& pb_output,
                              RawForwardOutput& raw_forward_output);
+
+void raw_forward_output_to_proto(const RawForwardOutput& raw_forward_output,
+                                 proto::ForwardOutput* pb_forward_output);
 
 void forward_output_to_proto(const torch::Tensor& next_tokens,
                              const torch::Tensor& logprobs,
