@@ -51,10 +51,6 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
     : LLMWorkerImpl(parallel_args, device, options) {
   initialize_xattention_workspace();
 
-  if (!is_driver()) {
-    return;
-  }
-
   step_threadpool_ = std::make_unique<ThreadPool>(
       options_.rec_worker_max_concurrency(), [this]() mutable {
         device_.set_device();
@@ -64,6 +60,10 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
         initialize_xattention_workspace();
 #endif
       });
+
+  if (!is_driver()) {
+    return;
+  }
 
   LOG(INFO) << "RecWorkerImpl constructor: "
             << options_.rec_worker_max_concurrency();

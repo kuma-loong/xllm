@@ -472,6 +472,7 @@ struct RawSampleOutput {
 
 struct RawForwardOutput {
   std::vector<RawSampleOutput> outputs;  // num seqs
+  bool final_sequence_output = false;
   std::vector<int64_t> expert_load_data;
   int32_t prepared_layer_id;
   // beam search kernel output

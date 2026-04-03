@@ -698,6 +698,7 @@ void proto_to_forward_output(const proto::ForwardOutput& pb_output,
                              RawForwardOutput& raw_forward_output) {
   Timer timer;
   size_t seq_nums = pb_output.outputs().size();
+  raw_forward_output.final_sequence_output = pb_output.final_sequence_output();
   raw_forward_output.outputs.reserve(seq_nums);
   size_t expert_load_data_size = pb_output.expert_load_data().size();
   raw_forward_output.expert_load_data.reserve(expert_load_data_size);
@@ -747,6 +748,8 @@ void proto_to_forward_output(const proto::ForwardOutput& pb_output,
 void raw_forward_output_to_proto(const RawForwardOutput& raw_forward_output,
                                  proto::ForwardOutput* pb_forward_output) {
   Timer timer;
+  pb_forward_output->set_final_sequence_output(
+      raw_forward_output.final_sequence_output);
   pb_forward_output->mutable_outputs()->Reserve(
       raw_forward_output.outputs.size());
   for (const auto& output : raw_forward_output.outputs) {

@@ -181,6 +181,7 @@ RawForwardOutput RecWorkerImpl::LLaDARecWorkPipeline::build_raw_output(
     const torch::Tensor& generated_tokens,
     int64_t answer_length) const {
   RawForwardOutput raw_output;
+  raw_output.final_sequence_output = true;
   RawSampleOutput sample;
   sample.tokens.reserve(answer_length);
 
@@ -195,7 +196,8 @@ RawForwardOutput RecWorkerImpl::LLaDARecWorkPipeline::build_raw_output(
   return raw_output;
 }
 
-torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
+std::pair<torch::Tensor, torch::Tensor>
+RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
     const torch::Tensor& logits,
     const SamplingParameters& sampling_params) {
   torch::Tensor filtered_logits = logits;
@@ -204,7 +206,17 @@ torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
       sampling_params.temperatures.numel() > 0) {
     temperature = sampling_params.temperatures[0].item<float>();
   }
-  if (temperature > 0.0f) {
+  if (temperature <= 0.0f) {
+    torch::Tensor next_tokens =
+        std::get<1>(filtered_logits.max(-1, true)).squeeze(-1);
+    torch::Tensor next_probs =
+        torch::softmax(filtered_logits, -1)
+            .gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1))
+            .squeeze(-1);
+    return {std::move(next_tokens), std::move(next_probs)};
+  }
+
+  if (temperature != 1.0f) {
     filtered_logits = filtered_logits / temperature;
   }
 
@@ -242,16 +254,13 @@ torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
         remove_mask, -std::numeric_limits<float>::infinity());
   }
 
-  bool do_sample = sampling_params.do_sample.defined() &&
-                   sampling_params.do_sample.numel() > 0 &&
-                   sampling_params.do_sample[0].item<bool>();
-  if (!do_sample && temperature <= 0.0f && top_k <= 0 && top_p >= 1.0f) {
-    return std::get<1>(filtered_logits.max(-1, true));
-  }
-
-  auto probs = torch::softmax(filtered_logits, -1);
-  return torch::multinomial(probs.view({-1, probs.size(-1)}), 1)
-      .view({logits.size(0), logits.size(1)});
+  torch::Tensor probs = torch::softmax(filtered_logits, -1);
+  torch::Tensor next_tokens =
+      torch::multinomial(probs.view({-1, probs.size(-1)}), 1)
+          .view({logits.size(0), logits.size(1)});
+  torch::Tensor next_probs =
+      probs.gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1)).squeeze(-1);
+  return {std::move(next_tokens), std::move(next_probs)};
 }
 
 std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
@@ -299,7 +308,8 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
             << rec_pipeline_type_to_string(
                    get_rec_pipeline_type(runtime_.worker.rec_model_kind_))
             << ", rank=" << runtime_.context->get_parallel_args().rank()
-            << ", device=" << runtime_.worker.device().index() << ", tp_size="
+            << ", device=" << static_cast<int>(runtime_.worker.device().index())
+            << ", tp_size="
             << runtime_.context->get_parallel_args().world_size()
             << ", prompt_tokens=" << prompt_length
             << ", max_tokens=" << gen_length << ", total_blocks=" << num_blocks
@@ -354,13 +364,10 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
       torch::Tensor active_logits =
           logits.view({1, current_window_end, -1})
               .slice(1, current_window_end - block_length, current_window_end);
-      torch::Tensor next_tokens =
-          sample_next_tokens(active_logits, input.sampling_params)
-              .to(token_options);
-      torch::Tensor next_probs =
-          torch::softmax(active_logits, -1)
-              .gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1))
-              .squeeze(-1);
+      std::pair<torch::Tensor, torch::Tensor> sampling_result =
+          sample_next_tokens(active_logits, input.sampling_params);
+      torch::Tensor next_tokens = sampling_result.first.to(token_options);
+      torch::Tensor next_probs = sampling_result.second;
 
       torch::Tensor mask_transfer_index = compute_llada_mask_transfer_index(
           next_probs, active_block_mask, llada_runtime_config, bool_options);
@@ -417,7 +424,7 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
 
   LOG(INFO) << "LLaDA worker finished generation"
             << ", rank=" << runtime_.context->get_parallel_args().rank()
-            << ", device=" << runtime_.worker.device().index()
+            << ", device=" << static_cast<int>(runtime_.worker.device().index())
             << ", prompt_tokens=" << prompt_length
             << ", max_tokens=" << gen_length
             << ", block_length=" << block_length

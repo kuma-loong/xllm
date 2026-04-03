@@ -460,6 +460,16 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
     }
 
     const auto& raw_sample_output = raw_output.outputs[output_idx];
+    if (raw_output.final_sequence_output && !target.from_sample_slot &&
+        !replace_fake_token) {
+      std::vector<Token> tokens;
+      tokens.reserve(raw_sample_output.tokens.size());
+      for (const auto& raw_token : raw_sample_output.tokens) {
+        tokens.emplace_back(make_token(raw_token));
+      }
+      seq->finalize_generated_tokens(tokens);
+      continue;
+    }
     for (size_t token_idx = 0; token_idx < raw_sample_output.tokens.size();
          ++token_idx) {
       const auto& raw_token = raw_sample_output.tokens[token_idx];

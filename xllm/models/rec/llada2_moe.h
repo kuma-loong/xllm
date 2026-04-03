@@ -235,7 +235,7 @@ REGISTER_MODEL_ARGS(llada2_moe, [&] {
   LOAD_ARG_OR(n_shared_experts, "num_shared_experts", 1);
   LOAD_ARG_OR(moe_intermediate_size, "moe_intermediate_size", 512);
   LOAD_ARG_OR(
-      moe_router_enable_expert_bias, "moe_router_enable_expert_bias", false);
+      moe_router_enable_expert_bias, "moe_router_enable_expert_bias", true);
   LOAD_ARG_OR(n_group, "n_group", 8);
   LOAD_ARG_OR(topk_group, "topk_group", 4);
   LOAD_ARG_OR(routed_scaling_factor, "routed_scaling_factor", 2.5f);
@@ -243,8 +243,8 @@ REGISTER_MODEL_ARGS(llada2_moe, [&] {
 
   LOAD_ARG_OR(vocab_size, "vocab_size", 157184);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 0);
-  LOAD_ARG_OR(eos_token_id, "eos_token_id", -1);
-  LOAD_ARG_OR(pad_token_id, "pad_token_id", 0);
+  LOAD_ARG_OR(eos_token_id, "eos_token_id", 156892);
+  LOAD_ARG_OR(pad_token_id, "pad_token_id", 156892);
 
   args->stop_token_ids().clear();
   if (args->eos_token_id() >= 0) {

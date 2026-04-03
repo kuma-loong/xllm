@@ -1275,6 +1275,7 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
     size += calculate_raw_sample_output_size(sample);
   }
 
+  size += type_size<bool>;  // final_sequence_output
   size += get_vector_size(output.expert_load_data);
   size += get_vector_size(output.src_seq_idxes);
   size += get_vector_size(output.out_tokens);
@@ -1340,6 +1341,7 @@ void deserialize_raw_forward_output(const char* buffer,
     read_raw_sample_output(buffer, sample);
   }
 
+  read_data(buffer, output.final_sequence_output);
   read_vector(buffer, output.expert_load_data);
 
   read_data(buffer, output.prepared_layer_id);
@@ -1354,6 +1356,7 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
     write_raw_sample_output(buffer, sample);
   }
 
+  write_data(buffer, output.final_sequence_output);
   write_vector(buffer, output.expert_load_data);
 
   write_data(buffer, output.prepared_layer_id);

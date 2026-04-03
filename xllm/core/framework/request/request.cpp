@@ -88,6 +88,10 @@ void Request::log_statistic(double total_latency) {
       const double generation_latency = total_latency - ttft;
       tpot = (generation_latency * 1000.0) / (gen_tokens - 1);
       gen_speed = gen_tokens / generation_latency;
+    } else if (state_.rec_type == RecType::kLLaDARec && gen_tokens > 0 &&
+               total_latency > 0) {
+      tpot = (total_latency * 1000.0) / static_cast<double>(gen_tokens);
+      gen_speed = static_cast<double>(gen_tokens) / total_latency;
     }
     LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
               << "x-request-time: " << x_request_time_ << ", "

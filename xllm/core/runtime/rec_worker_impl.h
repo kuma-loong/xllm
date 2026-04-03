@@ -21,6 +21,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "common/rec_model_utils.h"
@@ -295,8 +296,9 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                    int32_t mask_token_id) const;
     RawForwardOutput build_raw_output(const torch::Tensor& generated_tokens,
                                       int64_t answer_length) const;
-    torch::Tensor sample_next_tokens(const torch::Tensor& logits,
-                                     const SamplingParameters& sampling_params);
+    std::pair<torch::Tensor, torch::Tensor> sample_next_tokens(
+        const torch::Tensor& logits,
+        const SamplingParameters& sampling_params);
   };
 
   // Factory method to create pipeline (can access private classes)

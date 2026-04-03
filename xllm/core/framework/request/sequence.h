@@ -179,6 +179,7 @@ class Sequence final {
   // the token would be discarded if the sequence is still in prefill stage
   void append_token(const Token& token);
   void append_token(int64_t token_id) { append_token(Token(token_id)); }
+  void finalize_generated_tokens(const std::vector<Token>& tokens);
   void update_token(size_t index, const Token& token);
   void update_last_step_token(const Token& token, size_t token_offset = 0);
   bool has_new_tokens_generated() const {

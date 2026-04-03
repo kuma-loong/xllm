@@ -270,6 +270,7 @@ message SquenceOutput {
 
 message ForwardOutput {
   repeated SquenceOutput outputs = 2;
+  bool final_sequence_output = 8;
   repeated int64 expert_load_data = 3;
   int32 prepared_layer_id = 4;
   repeated int32 src_seq_idxes = 5;

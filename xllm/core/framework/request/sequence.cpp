@@ -251,6 +251,38 @@ void Sequence::append_token(const Token& token) {
   updated_since_last_beam_search_ = true;
 }
 
+void Sequence::finalize_generated_tokens(const std::vector<Token>& tokens) {
+  CHECK_LE(num_prompt_tokens_ + tokens.size(), tokens_.size())
+      << "exceed the token capacity of the sequence";
+  CHECK(!finished_) << "cannot set tokens for a finished sequence";
+
+  num_tokens_ = num_prompt_tokens_;
+  cur_generated_token_idx_ = num_prompt_tokens_;
+
+  for (size_t token_idx = 0; token_idx < tokens.size(); ++token_idx) {
+    const auto& token = tokens[token_idx];
+    if (token_idx == 0) {
+      is_first_token_ = true;
+      record_first_token(token);
+    }
+    const size_t cur_idx = num_tokens_++;
+    const int32_t token_id = static_cast<int32_t>(token.id);
+    tokens_[cur_idx] = token_id;
+    if (need_unique_tokens_) {
+      token_to_count_map_[token_id]++;
+    }
+  }
+
+  cur_generated_token_idx_ = static_cast<uint32_t>(num_tokens_);
+  auto finish_reason = sequence_params_.stopping_checker->check(
+      this->tokens(), num_prompt_tokens_);
+  if (finish_reason != FinishReason::NONE) {
+    finish_reason_ = finish_reason;
+  }
+  finish();
+  updated_since_last_beam_search_ = true;
+}
+
 void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   CHECK(sequence_params_.enable_schedule_overlap)
       << "update_last_step_token should only be called when "
