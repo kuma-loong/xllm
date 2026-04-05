@@ -296,8 +296,8 @@ std::unique_ptr<RecWorkerImpl::RecWorkPipeline> RecWorkerImpl::create_pipeline(
       return std::make_unique<OneRecWorkPipeline>(runtime);
     case RecPipelineType::kLlmRecMultiRoundPipeline:
       return std::make_unique<LlmRecMultiRoundPipeline>(runtime);
-    case RecPipelineType::kLLaDARecWorkerLoop:
-      return std::make_unique<LLaDARecWorkPipeline>(runtime);
+    case RecPipelineType::kDlmWorkerLoop:
+      return std::make_unique<DlmDecodePipeline>(runtime);
     default:
       LOG(FATAL) << "Unknown RecWorkerImpl pipeline type: "
                  << static_cast<int>(type);

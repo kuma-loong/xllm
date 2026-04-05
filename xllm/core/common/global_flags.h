@@ -307,13 +307,29 @@ DECLARE_bool(use_audio_in_video);
 DECLARE_uint32(rec_worker_max_concurrency);
 
 DECLARE_int32(llada_block_length);
+
 DECLARE_int32(llada_steps);
+
+DECLARE_string(llada_mode);
+
+DECLARE_string(llada_algorithm);
+
+DECLARE_string(llada_cache_mode);
+
 DECLARE_double(llada_threshold);
+
 DECLARE_double(llada_editing_threshold);
+
+DECLARE_double(llada_penalty_lambda);
+
 DECLARE_int32(llada_max_post_steps);
+
 DECLARE_int32(llada_minimal_topk);
+
 DECLARE_int32(llada_num_to_transfer);
+
 DECLARE_bool(llada_eos_early_stop);
+
 DECLARE_int32(llada_mask_id);
 
 #if defined(USE_NPU)

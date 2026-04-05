@@ -16,97 +16,38 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <string>
 
 #include "common/rec_model_utils.h"
 #include "framework/model/model_input_params.h"
 #include "rec_worker_impl.h"
+#include "runtime/dlm_runtime.h"
 
 namespace xllm {
 
 namespace {
 
-int32_t compute_llada_effective_steps(int32_t gen_length,
-                                      const LLaDARuntimeConfig& config) {
-  return std::min(config.steps,
-                  std::max(gen_length / std::max(config.minimal_topk, 1), 1));
+torch::ScalarType get_dlm_probability_dtype() {
+#if defined(USE_NPU)
+  return torch::kFloat32;
+#else
+  return torch::kFloat64;
+#endif
 }
 
-int32_t compute_llada_total_blocks(int32_t prompt_length,
-                                   int32_t gen_length,
-                                   int32_t block_length) {
-  return (prompt_length + gen_length + block_length - 1) / block_length;
-}
-
-torch::Tensor build_prompt_mask_in_block(const torch::TensorOptions& options,
-                                         int32_t block_start_pos,
-                                         int32_t prompt_length,
-                                         int32_t block_length) {
-  torch::Tensor prompt_mask_in_block = torch::zeros({block_length}, options);
-  if (block_start_pos < prompt_length) {
-    const int32_t prompt_end_in_block =
-        std::min(prompt_length - block_start_pos, block_length);
-    prompt_mask_in_block.slice(0, 0, prompt_end_in_block).fill_(true);
-  }
-  return prompt_mask_in_block;
-}
-
-torch::Tensor compute_llada_mask_transfer_index(
-    const torch::Tensor& next_probs,
-    const torch::Tensor& active_block_mask,
-    const LLaDARuntimeConfig& config,
-    const torch::TensorOptions& bool_options) {
-  torch::Tensor mask_transfer_index =
-      torch::zeros_like(next_probs, bool_options);
-  if (!active_block_mask.any().item<bool>()) {
-    return mask_transfer_index;
-  }
-
-  torch::Tensor mask_confidence = torch::where(
-      active_block_mask,
-      next_probs,
-      torch::full_like(next_probs, -std::numeric_limits<float>::infinity()));
-  torch::Tensor high_conf_mask =
-      mask_confidence.gt(config.threshold).logical_and(active_block_mask);
-  const int64_t num_high_confidence = high_conf_mask.sum().item<int64_t>();
-  if (num_high_confidence >= config.num_to_transfer) {
-    return high_conf_mask;
-  }
-
-  const int64_t num_available = active_block_mask.sum().item<int64_t>();
-  if (num_available <= 0) {
-    return mask_transfer_index;
-  }
-
-  torch::Tensor topk_indices = std::get<1>(mask_confidence.topk(
-      std::min<int64_t>(config.num_to_transfer, num_available), -1));
-  mask_transfer_index.scatter_(1, topk_indices, true);
-  return mask_transfer_index.logical_and(active_block_mask);
-}
-
-torch::Tensor compute_llada_editing_transfer_index(
-    const torch::Tensor& next_probs,
-    const torch::Tensor& next_tokens,
-    const torch::Tensor& old_block_tokens,
-    const torch::Tensor& active_block_mask,
-    const torch::Tensor& prompt_mask_in_block,
-    const LLaDARuntimeConfig& config) {
-  torch::Tensor editable_positions =
-      active_block_mask.logical_not().logical_and(
-          prompt_mask_in_block.unsqueeze(0).logical_not());
-  torch::Tensor editing_confidence = torch::where(
-      editable_positions,
-      next_probs,
-      torch::full_like(next_probs, -std::numeric_limits<float>::infinity()));
-  return editing_confidence.gt(config.editing_threshold)
-      .logical_and(editable_positions)
-      .logical_and(next_tokens.ne(old_block_tokens));
+torch::Tensor add_gumbel_noise(const torch::Tensor& logits, float temperature) {
+  const auto prob_dtype = get_dlm_probability_dtype();
+  auto uniform = torch::rand_like(logits, logits.options().dtype(prob_dtype))
+                     .clamp_(1e-12, 1.0 - 1e-12);
+  auto gumbel = -torch::log(-torch::log(uniform));
+  return logits.to(prob_dtype) / static_cast<double>(temperature) + gumbel;
 }
 
 }  // namespace
 
-ForwardInput RecWorkerImpl::LLaDARecWorkPipeline::prepare_inputs(Batch& batch) {
+ForwardInput RecWorkerImpl::DlmDecodePipeline::prepare_inputs(Batch& batch) {
   ThreadPool* thread_pool =
       runtime_.worker.input_builder_thread_pool_
           ? runtime_.worker.input_builder_thread_pool_.get()
@@ -118,25 +59,7 @@ ForwardInput RecWorkerImpl::LLaDARecWorkPipeline::prepare_inputs(Batch& batch) {
       thread_pool);
 }
 
-torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::build_attention_mask(
-    int32_t active_length,
-    int32_t block_length) const {
-  const int32_t num_active_blocks =
-      (active_length + block_length - 1) / block_length;
-  const torch::Device device = runtime_.worker.device();
-  torch::Tensor block_mask = torch::tril(torch::ones(
-      {num_active_blocks, num_active_blocks},
-      torch::TensorOptions().device(device).dtype(torch::kFloat32)));
-  torch::Tensor attention_mask = block_mask.repeat_interleave(block_length, 0)
-                                     .repeat_interleave(block_length, 1)
-                                     .slice(0, 0, active_length)
-                                     .slice(1, 0, active_length)
-                                     .unsqueeze(0)
-                                     .unsqueeze(0);
-  return (torch::ones_like(attention_mask) - attention_mask) * -1e9;
-}
-
-torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::initialize_tokens(
+torch::Tensor RecWorkerImpl::DlmDecodePipeline::initialize_tokens(
     const ForwardInput& input,
     int32_t prompt_length,
     int32_t total_length,
@@ -151,7 +74,7 @@ torch::Tensor RecWorkerImpl::LLaDARecWorkPipeline::initialize_tokens(
   return tokens;
 }
 
-int64_t RecWorkerImpl::LLaDARecWorkPipeline::finalize_answer_length(
+int64_t RecWorkerImpl::DlmDecodePipeline::finalize_answer_length(
     const torch::Tensor& generated_tokens,
     int32_t eos_token_id,
     int32_t mask_token_id) const {
@@ -177,7 +100,7 @@ int64_t RecWorkerImpl::LLaDARecWorkPipeline::finalize_answer_length(
   return std::max<int64_t>(first_mask_index, 0);
 }
 
-RawForwardOutput RecWorkerImpl::LLaDARecWorkPipeline::build_raw_output(
+RawForwardOutput RecWorkerImpl::DlmDecodePipeline::build_raw_output(
     const torch::Tensor& generated_tokens,
     int64_t answer_length) const {
   RawForwardOutput raw_output;
@@ -197,7 +120,7 @@ RawForwardOutput RecWorkerImpl::LLaDARecWorkPipeline::build_raw_output(
 }
 
 std::pair<torch::Tensor, torch::Tensor>
-RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
+RecWorkerImpl::DlmDecodePipeline::sample_next_tokens(
     const torch::Tensor& logits,
     const SamplingParameters& sampling_params) {
   torch::Tensor filtered_logits = logits;
@@ -209,15 +132,12 @@ RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
   if (temperature <= 0.0f) {
     torch::Tensor next_tokens =
         std::get<1>(filtered_logits.max(-1, true)).squeeze(-1);
+    const auto prob_dtype = get_dlm_probability_dtype();
     torch::Tensor next_probs =
-        torch::softmax(filtered_logits, -1)
+        torch::softmax(filtered_logits.to(prob_dtype), -1)
             .gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1))
             .squeeze(-1);
     return {std::move(next_tokens), std::move(next_probs)};
-  }
-
-  if (temperature != 1.0f) {
-    filtered_logits = filtered_logits / temperature;
   }
 
   int64_t top_k = -1;
@@ -254,23 +174,24 @@ RecWorkerImpl::LLaDARecWorkPipeline::sample_next_tokens(
         remove_mask, -std::numeric_limits<float>::infinity());
   }
 
-  torch::Tensor probs = torch::softmax(filtered_logits, -1);
+  torch::Tensor sample_logits = add_gumbel_noise(filtered_logits, temperature);
   torch::Tensor next_tokens =
-      torch::multinomial(probs.view({-1, probs.size(-1)}), 1)
-          .view({logits.size(0), logits.size(1)});
+      std::get<1>(sample_logits.max(-1, true)).squeeze(-1);
+  const auto prob_dtype = get_dlm_probability_dtype();
+  torch::Tensor probs = torch::softmax(filtered_logits.to(prob_dtype), -1);
   torch::Tensor next_probs =
       probs.gather(-1, next_tokens.to(torch::kInt64).unsqueeze(-1)).squeeze(-1);
   return {std::move(next_tokens), std::move(next_probs)};
 }
 
-std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
+std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
     const ForwardInput& input) {
   runtime_.worker.device_.set_device();
-  const auto* llada_params = input.input_params.llada_params();
-  CHECK(llada_params != nullptr) << "LLaDA worker requires llada_params.";
+  const auto* dlm_params = input.input_params.dlm_params();
+  CHECK(dlm_params != nullptr) << "DLM worker requires dlm_params.";
 
-  const int32_t prompt_length = llada_params->prompt_length;
-  const int32_t gen_length = llada_params->max_generated_tokens;
+  const int32_t prompt_length = dlm_params->prompt_length;
+  const int32_t gen_length = dlm_params->max_generated_tokens;
   CHECK_GT(prompt_length, 0);
   CHECK_GT(gen_length, 0);
   LLaDARuntimeConfig llada_runtime_config;
@@ -280,6 +201,7 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
       &llada_runtime_config,
       &config_error_message))
       << "LLaDA runtime_config_validation failed: " << config_error_message;
+  DlmDecodeAlgorithm decode_algorithm(llada_runtime_config);
 
   auto device = runtime_.worker.device();
   auto token_options =
@@ -287,23 +209,33 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
   auto bool_options = torch::TensorOptions().device(device).dtype(torch::kBool);
 
   const int32_t effective_steps =
-      compute_llada_effective_steps(gen_length, llada_runtime_config);
-  const int32_t block_length = llada_runtime_config.block_length;
+      decode_algorithm.compute_effective_steps(gen_length);
+  const int32_t block_length = decode_algorithm.config().block_length;
   const int32_t num_blocks =
-      compute_llada_total_blocks(prompt_length, gen_length, block_length);
+      decode_algorithm.compute_total_blocks(prompt_length, gen_length);
   const int32_t total_length = num_blocks * block_length;
+  const bool enable_prefix_cache =
+      decode_algorithm.config().cache_mode == DlmCacheMode::kPrefix;
+  const int32_t num_layers = runtime_.context->get_model_args().n_layers();
 
   torch::Tensor x = initialize_tokens(
-      input, prompt_length, total_length, llada_runtime_config.mask_id);
+      input, prompt_length, total_length, decode_algorithm.config().mask_id);
   torch::Tensor position_ids =
       torch::arange(total_length, token_options).view({1, total_length});
 
   const int32_t prefill_blocks = prompt_length / block_length;
+  DlmPrefixCacheManager prefix_cache_manager(num_layers);
+  std::vector<KVCache> no_cache_kv_caches(static_cast<size_t>(num_layers));
   bool eos_early_stopped = false;
-  LOG(INFO) << "LLaDA worker starts generation"
+  int32_t total_refine_steps = 0;
+  int32_t total_cache_updates = 0;
+  LOG(INFO) << "DLM worker starts generation"
             << ", model_type="
             << runtime_.context->get_model_args().model_type() << ", rec_type="
             << rec_model_kind_to_string(runtime_.worker.rec_model_kind_)
+            << ", family="
+            << rec_model_family_to_string(
+                   get_rec_model_family(runtime_.worker.rec_model_kind_))
             << ", pipeline_type="
             << rec_pipeline_type_to_string(
                    get_rec_pipeline_type(runtime_.worker.rec_model_kind_))
@@ -313,36 +245,119 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
             << runtime_.context->get_parallel_args().world_size()
             << ", prompt_tokens=" << prompt_length
             << ", max_tokens=" << gen_length << ", total_blocks=" << num_blocks
-            << ", " << llada_runtime_config_to_string(llada_runtime_config);
+            << ", "
+            << dlm_runtime_config_to_string(
+                   get_dlm_runtime_config(runtime_.worker.rec_model_kind_))
+            << ", " << llada_runtime_config_to_string(decode_algorithm.config())
+            << ", worker_cache_path="
+            << (enable_prefix_cache ? "local_prefix_cache" : "disabled");
+
+  auto run_cached_block_forward = [&](const torch::Tensor& block_tokens,
+                                      const torch::Tensor& block_positions,
+                                      const DlmBlockRange& cache_write_range,
+                                      bool update_cache) -> torch::Tensor {
+    const int32_t active_cache_length =
+        prefix_cache_manager.active_length_for(cache_write_range);
+    DlmForwardBatch forward_batch;
+    forward_batch.forward_mode = DlmForwardMode::kDecode;
+    forward_batch.tokens = block_tokens;
+    forward_batch.positions = block_positions;
+    forward_batch.attention_mask = build_dlm_visible_attention_mask(
+        device, block_tokens.size(1), active_cache_length);
+    forward_batch.cache_write_range = cache_write_range;
+    forward_batch.committed_prefix_length =
+        prefix_cache_manager.committed_prefix_length();
+    forward_batch.active_cache_length = active_cache_length;
+    forward_batch.use_cache =
+        prefix_cache_manager.can_use_prefix_for(cache_write_range);
+    forward_batch.update_cache = update_cache;
+    ModelInputParams model_input_params =
+        make_dlm_model_input_params(forward_batch);
+    auto model_output =
+        runtime_.model->forward(block_tokens.reshape({-1}),
+                                block_positions.reshape({-1}),
+                                prefix_cache_manager.mutable_caches(),
+                                model_input_params);
+    if (update_cache) {
+      prefix_cache_manager.mark_prefix_committed(cache_write_range);
+      ++total_cache_updates;
+    }
+    return runtime_.model->logits(model_output.hidden_states, torch::Tensor())
+        .view({1, block_tokens.size(1), -1});
+  };
+
+  auto run_full_window_forward =
+      [&](const torch::Tensor& window_tokens,
+          const torch::Tensor& window_positions,
+          const torch::Tensor& attention_mask) -> torch::Tensor {
+    DlmForwardBatch forward_batch;
+    forward_batch.forward_mode = DlmForwardMode::kPrefill;
+    forward_batch.tokens = window_tokens;
+    forward_batch.positions = window_positions;
+    forward_batch.attention_mask = attention_mask;
+    ModelInputParams model_input_params =
+        make_dlm_model_input_params(forward_batch);
+    auto model_output = runtime_.model->forward(window_tokens.reshape({-1}),
+                                                window_positions.reshape({-1}),
+                                                no_cache_kv_caches,
+                                                model_input_params);
+    return runtime_.model->logits(model_output.hidden_states, torch::Tensor())
+        .view({1, window_tokens.size(1), -1});
+  };
+
+  if (enable_prefix_cache) {
+    for (int32_t block_id = 0; block_id < prefill_blocks; ++block_id) {
+      const DlmBlockRange prompt_block_range = {block_id * block_length,
+                                                (block_id + 1) * block_length};
+      torch::Tensor prompt_block =
+          x.slice(1, prompt_block_range.start, prompt_block_range.end).clone();
+      torch::Tensor prompt_positions = position_ids.slice(
+          1, prompt_block_range.start, prompt_block_range.end);
+      (void)run_cached_block_forward(prompt_block,
+                                     prompt_positions,
+                                     prompt_block_range,
+                                     /*update_history_cache=*/true);
+    }
+  }
 
   for (int32_t num_block = prefill_blocks; num_block < num_blocks;
        ++num_block) {
-    const int32_t current_window_end = (num_block + 1) * block_length;
-    torch::Tensor cur_x = x.slice(1, 0, current_window_end).clone();
+    const DlmBlockRange block_range = {num_block * block_length,
+                                       (num_block + 1) * block_length};
+    torch::Tensor cur_tokens =
+        (enable_prefix_cache ? x.slice(1, block_range.start, block_range.end)
+                             : x.slice(1, 0, block_range.end))
+            .clone();
     torch::Tensor cur_positions =
-        position_ids.slice(1, 0, current_window_end).reshape({-1});
-    torch::Tensor cur_attn_mask =
-        build_attention_mask(current_window_end, block_length);
-    const int32_t block_start_pos = num_block * block_length;
+        (enable_prefix_cache
+             ? position_ids.slice(1, block_range.start, block_range.end)
+             : position_ids.slice(1, 0, block_range.end));
+    torch::Tensor full_window_attn_mask =
+        enable_prefix_cache ? torch::Tensor()
+                            : build_dlm_block_attention_mask(
+                                  device, cur_tokens.size(1), block_length);
 
-    int32_t post_steps = 0;
     int32_t refine_steps = 0;
+    int32_t post_edit_steps = 0;
+    bool cache_matches_current_tokens = false;
     while (true) {
       ++refine_steps;
-      torch::Tensor old_block_tokens =
-          cur_x.slice(1, current_window_end - block_length, current_window_end)
-              .clone();
+      ++total_refine_steps;
+      torch::Tensor block_tokens_view =
+          enable_prefix_cache
+              ? cur_tokens
+              : cur_tokens.slice(1, block_range.start, block_range.end);
+      torch::Tensor old_block_tokens = block_tokens_view.clone();
       torch::Tensor active_block_mask =
-          old_block_tokens.eq(llada_runtime_config.mask_id);
-      if (!active_block_mask.any().item<bool>()) {
-        ++post_steps;
+          old_block_tokens.eq(decode_algorithm.config().mask_id);
+      DlmDecodeStepState step_state;
+      step_state.has_mask = active_block_mask.any().item<bool>();
+      if (!step_state.has_mask) {
+        ++post_edit_steps;
       }
-      if (post_steps > llada_runtime_config.max_post_steps) {
-        break;
-      }
-      if (refine_steps >
-          effective_steps + llada_runtime_config.max_post_steps) {
-        LOG(WARNING) << "LLaDA block_refine_step_cap"
+      step_state.post_edit_step = post_edit_steps;
+      if (!decode_algorithm.should_continue(step_state, refine_steps)) {
+        LOG(WARNING) << "DLM block_refine_step_cap"
                      << ", rank="
                      << runtime_.context->get_parallel_args().rank()
                      << ", block=" << num_block
@@ -350,56 +365,72 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
         break;
       }
 
-      torch::Tensor prompt_mask_in_block = build_prompt_mask_in_block(
-          bool_options, block_start_pos, prompt_length, block_length);
+      torch::Tensor prompt_mask_in_block =
+          decode_algorithm.build_prompt_mask_in_block(
+              bool_options, block_range, prompt_length);
 
-      ModelInputParams model_input_params;
-      model_input_params.graph_buffer.attn_mask = cur_attn_mask;
-      auto model_output = runtime_.model->forward(cur_x.reshape({-1}),
-                                                  cur_positions,
-                                                  runtime_.worker.kv_caches_,
-                                                  model_input_params);
-      torch::Tensor logits =
-          runtime_.model->logits(model_output.hidden_states, torch::Tensor());
       torch::Tensor active_logits =
-          logits.view({1, current_window_end, -1})
-              .slice(1, current_window_end - block_length, current_window_end);
+          enable_prefix_cache
+              ? run_cached_block_forward(cur_tokens,
+                                         cur_positions,
+                                         block_range,
+                                         /*update_cache=*/false)
+              : run_full_window_forward(
+                    cur_tokens, cur_positions, full_window_attn_mask)
+                    .slice(1, block_range.start, block_range.end);
+      cache_matches_current_tokens = true;
+      if (decode_algorithm.config().algorithm ==
+          LLaDAAlgorithmType::kJointThreshold) {
+        auto logits_view = active_logits.squeeze(0);
+        decode_algorithm.apply_penalty(logits_view,
+                                       old_block_tokens.squeeze(0));
+        active_logits = logits_view.unsqueeze(0);
+      }
       std::pair<torch::Tensor, torch::Tensor> sampling_result =
           sample_next_tokens(active_logits, input.sampling_params);
       torch::Tensor next_tokens = sampling_result.first.to(token_options);
       torch::Tensor next_probs = sampling_result.second;
 
-      torch::Tensor mask_transfer_index = compute_llada_mask_transfer_index(
-          next_probs, active_block_mask, llada_runtime_config, bool_options);
-      torch::Tensor editing_transfer_index =
-          compute_llada_editing_transfer_index(next_probs,
+      DlmTransferPlan transfer_plan =
+          decode_algorithm.build_transfer_plan(next_probs,
                                                next_tokens,
                                                old_block_tokens,
-                                               active_block_mask,
                                                prompt_mask_in_block,
-                                               llada_runtime_config);
-      torch::Tensor final_transfer_index =
-          mask_transfer_index.logical_or(editing_transfer_index);
+                                               step_state,
+                                               bool_options);
 
-      if (final_transfer_index.any().item<bool>()) {
-        auto block_slice = cur_x.slice(
-            1, current_window_end - block_length, current_window_end);
-        block_slice.masked_scatter_(
-            final_transfer_index,
-            next_tokens.masked_select(final_transfer_index));
+      if (transfer_plan.transfer_index.any().item<bool>()) {
+        block_tokens_view.masked_scatter_(
+            transfer_plan.transfer_index,
+            next_tokens.masked_select(transfer_plan.transfer_index));
+        cache_matches_current_tokens = false;
       }
 
-      if (!active_block_mask.any().item<bool>() &&
-          !editing_transfer_index.any().item<bool>()) {
+      if (transfer_plan.finished) {
         break;
       }
     }
 
-    x.slice(1, 0, current_window_end).copy_(cur_x);
-    if (llada_runtime_config.eos_early_stop) {
-      torch::Tensor generated_part =
-          x.slice(1, prompt_length, current_window_end);
-      if (!generated_part.eq(llada_runtime_config.mask_id).any().item<bool>()) {
+    if (enable_prefix_cache) {
+      x.slice(1, block_range.start, block_range.end).copy_(cur_tokens);
+      if (!cache_matches_current_tokens) {
+        (void)run_cached_block_forward(cur_tokens,
+                                       cur_positions,
+                                       block_range,
+                                       /*update_cache=*/true);
+      } else if (prefix_cache_manager.committed_prefix_length() <
+                 block_range.end) {
+        prefix_cache_manager.mark_prefix_committed(block_range);
+        ++total_cache_updates;
+      }
+    } else {
+      x.slice(1, 0, block_range.end).copy_(cur_tokens);
+    }
+    if (decode_algorithm.config().eos_early_stop) {
+      torch::Tensor generated_part = x.slice(1, prompt_length, block_range.end);
+      if (!generated_part.eq(decode_algorithm.config().mask_id)
+               .any()
+               .item<bool>()) {
         torch::Tensor eos_hits = generated_part.eq(
             runtime_.context->get_model_args().eos_token_id());
         if (eos_hits.any().item<bool>()) {
@@ -417,18 +448,20 @@ std::optional<ForwardOutput> RecWorkerImpl::LLaDARecWorkPipeline::step(
   const int64_t answer_length =
       finalize_answer_length(generated_tokens,
                              runtime_.context->get_model_args().eos_token_id(),
-                             llada_runtime_config.mask_id);
+                             decode_algorithm.config().mask_id);
   generated_tokens = generated_tokens.slice(1, 0, answer_length);
   RawForwardOutput raw_output =
       build_raw_output(generated_tokens, answer_length);
 
-  LOG(INFO) << "LLaDA worker finished generation"
+  LOG(INFO) << "DLM worker finished generation"
             << ", rank=" << runtime_.context->get_parallel_args().rank()
             << ", device=" << static_cast<int>(runtime_.worker.device().index())
             << ", prompt_tokens=" << prompt_length
             << ", max_tokens=" << gen_length
             << ", block_length=" << block_length
             << ", steps=" << effective_steps << ", total_blocks=" << num_blocks
+            << ", total_refine_steps=" << total_refine_steps
+            << ", cache_updates=" << total_cache_updates
             << ", generated_tokens=" << answer_length
             << ", eos_early_stop=" << eos_early_stopped;
 

@@ -628,7 +628,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         proto_to_forward_input(
             pb_forward_input, forward_input, options_.num_decoding_tokens());
 
-        if (forward_input.input_params.has_llada_params()) {
+        if (forward_input.input_params.has_dlm_params()) {
           auto future = worker_->step_async(forward_input);
           auto forward_outputs = std::move(future).get();
           if (forward_outputs &&

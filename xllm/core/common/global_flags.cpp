@@ -639,26 +639,54 @@ DEFINE_uint32(rec_worker_max_concurrency,
 DEFINE_int32(llada_block_length,
              32,
              "Block length for LLaDA worker-driven generation.");
+
 DEFINE_int32(llada_steps, 32, "Refinement steps for each LLaDA block.");
+
+DEFINE_string(llada_mode,
+              "quality",
+              "Preset mode for LLaDA decoding. Supported values: quality, "
+              "speed, custom.");
+
+DEFINE_string(llada_algorithm,
+              "joint_threshold",
+              "LLaDA dLLM algorithm. Supported values: joint_threshold, "
+              "low_confidence.");
+
+DEFINE_string(llada_cache_mode,
+              "prefix",
+              "Cache mode for LLaDA/DLM generation. Supported values: none, "
+              "prefix.");
+
 DEFINE_double(llada_threshold,
               0.7,
               "Confidence threshold for transferring masked LLaDA tokens.");
+
 DEFINE_double(
     llada_editing_threshold,
     0.5,
     "Confidence threshold for editing non-mask tokens in LLaDA generation.");
+
+DEFINE_double(llada_penalty_lambda,
+              0.0,
+              "Repetition penalty subtracted from previous-token logits during "
+              "LLaDA JointThreshold editing.");
+
 DEFINE_int32(llada_max_post_steps,
              16,
              "Maximum post-edit refinement rounds for one LLaDA block.");
+
 DEFINE_int32(llada_minimal_topk,
              1,
              "Minimal top-k divisor used to clamp effective LLaDA steps.");
+
 DEFINE_int32(llada_num_to_transfer,
              1,
              "Minimum number of tokens transferred per LLaDA refinement step.");
+
 DEFINE_bool(llada_eos_early_stop,
             true,
             "Whether LLaDA generation stops early once EOS is resolved.");
+
 DEFINE_int32(llada_mask_id,
              156895,
              "Mask token id used by the LLaDA generation template.");

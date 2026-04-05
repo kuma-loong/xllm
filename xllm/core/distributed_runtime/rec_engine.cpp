@@ -367,12 +367,14 @@ Engine::KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
                                                  head_dim_,
                                                  args_.n_layers(),
                                                  dtype_);
-    LOG(INFO) << "LLaDA uses placeholder KV cache only"
+    LOG(INFO) << "LLaDA uses engine placeholder KV cache with worker-local DLM "
+                 "range cache"
               << ", model_type=" << args_.model_type()
               << ", rec_type=" << rec_model_kind_to_string(rec_model_kind_)
               << ", pipeline_type="
               << rec_pipeline_type_to_string(
                      get_rec_pipeline_type(rec_model_kind_))
+              << ", worker_cache_path=local_dlm_range_cache"
               << ", block_size=" << options_.block_size()
               << ", n_local_kv_heads=" << n_local_kv_heads_
               << ", head_dim=" << head_dim_ << ", n_layers=" << args_.n_layers()
@@ -417,12 +419,13 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
             << ", blocks: " << kv_cache_cap.n_blocks
             << ", slot_size: " << kv_cache_cap.slot_size;
   if (rec_model_kind_ == RecModelKind::kLLaDARec) {
-    LOG(INFO) << "Allocating placeholder KV cache for LLaDA only"
+    LOG(INFO) << "Allocating engine placeholder KV cache for LLaDA"
               << ", model_type=" << args_.model_type()
               << ", rec_type=" << rec_model_kind_to_string(rec_model_kind_)
               << ", pipeline_type="
               << rec_pipeline_type_to_string(
-                     get_rec_pipeline_type(rec_model_kind_));
+                     get_rec_pipeline_type(rec_model_kind_))
+              << ", worker_cache_path=local_dlm_range_cache";
   }
 
   const int32_t block_size = options_.block_size();
@@ -986,8 +989,8 @@ int64_t RecEngine::LLaDARecEnginePipeline::estimate_min_available_memory() {
 bool RecEngine::LLaDARecEnginePipeline::allocate_kv_cache(
     const std::vector<std::vector<int64_t>>& kv_cache_shape) {
   CHECK_EQ(kv_cache_shape.size(), 2)
-      << "LLaDA placeholder KV cache expects K/V shapes only.";
-  LOG(INFO) << "LLaDA placeholder KV cache shapes"
+      << "LLaDA engine placeholder KV cache expects K/V shapes only.";
+  LOG(INFO) << "LLaDA engine placeholder KV cache shapes"
             << ", k_shape=[" << kv_cache_shape[0] << "]"
             << ", v_shape=[" << kv_cache_shape[1] << "]";
   if (!engine_.worker_clients_.empty()) {
@@ -1336,7 +1339,7 @@ std::unique_ptr<RecEngine::RecEnginePipeline> RecEngine::create_pipeline(
       return std::make_unique<RecMultiRoundEnginePipeline>(engine);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecEnginePipeline>(engine);
-    case RecPipelineType::kLLaDARecWorkerLoop:
+    case RecPipelineType::kDlmWorkerLoop:
       return std::make_unique<LLaDARecEnginePipeline>(engine);
     default:
       LOG(FATAL) << "Unknown RecEngine pipeline type: "

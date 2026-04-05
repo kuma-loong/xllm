@@ -54,7 +54,7 @@ bool FixedStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   if (request_queue_.write(request)) {  //.get()
     if (request->state().rec_type == RecType::kLLaDARec) {
       const auto& sequence = request->sequences().front();
-      LOG(INFO) << "LLaDA scheduler accepted request"
+      LOG(INFO) << "DLM scheduler accepted request"
                 << ", request_id=" << request->request_id()
                 << ", prompt_tokens=" << sequence->num_prompt_tokens()
                 << ", max_tokens="

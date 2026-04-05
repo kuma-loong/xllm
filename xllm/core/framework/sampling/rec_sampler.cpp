@@ -95,7 +95,7 @@ RecSampler::create_sampling_strategy(RecPipelineType type,
     case RecPipelineType::kLlmRecDefault:
     case RecPipelineType::kLlmRecWithMmData:
     case RecPipelineType::kOneRecDefault:
-    case RecPipelineType::kLLaDARecWorkerLoop:
+    case RecPipelineType::kDlmWorkerLoop:
       return std::make_unique<DefaultSamplingStrategy>(sampler);
     default:
       LOG(FATAL) << "Unknown RecPipelineType: " << static_cast<int>(type);

@@ -38,6 +38,36 @@ void aprint(std::vector<T> v, const std::string& name, int global_rank) {
   LOG(INFO) << "GlobalRank = " << global_rank << ", name = " << name
             << ", value = " << value;
 }
+
+void populate_dlm_request_params_from_proto(const proto::ForwardInput* input,
+                                            ModelInputParams* input_params) {
+  CHECK(input != nullptr);
+  CHECK(input_params != nullptr);
+  if (input->llada_prompt_length() <= 0 ||
+      input->llada_max_generated_tokens() <= 0) {
+    return;
+  }
+
+  auto& dlm_params = input_params->mutable_dlm_params();
+  dlm_params.prompt_length = input->llada_prompt_length();
+  dlm_params.max_generated_tokens = input->llada_max_generated_tokens();
+}
+
+void populate_proto_from_dlm_request_params(
+    const ModelInputParams& input_params,
+    proto::ForwardInput* output) {
+  CHECK(output != nullptr);
+  const auto* dlm_params = input_params.dlm_params();
+  if (dlm_params == nullptr) {
+    return;
+  }
+
+  output->set_llada_prompt_length(dlm_params->prompt_length);
+  output->set_llada_max_generated_tokens(dlm_params->max_generated_tokens);
+  // Worker-local cache metadata is intentionally not serialized. The DLM
+  // worker loop derives committed-prefix/cache-write/update flags locally for
+  // each forward and keeps them off the request-level RPC contract.
+}
 }  // namespace
 
 void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
@@ -364,13 +394,7 @@ void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
     proto_to_mmdata(pb_forward_input->mm_data(), &input_params.mm_data);
   }
 
-  if (pb_forward_input->llada_prompt_length() > 0 &&
-      pb_forward_input->llada_max_generated_tokens() > 0) {
-    auto& llada_params = input_params.mutable_llada_params();
-    llada_params.prompt_length = pb_forward_input->llada_prompt_length();
-    llada_params.max_generated_tokens =
-        pb_forward_input->llada_max_generated_tokens();
-  }
+  populate_dlm_request_params_from_proto(pb_forward_input, &input_params);
 
   COUNTER_ADD(proto_latency_seconds_proto2i, timer.elapsed_seconds());
 }
@@ -515,11 +539,7 @@ void forward_input_to_proto(const ForwardInput& inputs,
                         sample_idxes_slice);
   }
 
-  if (const auto* llada_params = inputs.input_params.llada_params()) {
-    pb_forward_input->set_llada_prompt_length(llada_params->prompt_length);
-    pb_forward_input->set_llada_max_generated_tokens(
-        llada_params->max_generated_tokens);
-  }
+  populate_proto_from_dlm_request_params(inputs.input_params, pb_forward_input);
 
   COUNTER_ADD(proto_latency_seconds_i2proto, timer.elapsed_seconds());
 }

@@ -52,8 +52,6 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
-    (void)kv_caches;
-
     auto flat_tokens = tokens;
     auto flat_positions = positions;
     if (flat_tokens.dim() > 1) {
@@ -87,9 +85,33 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
     CHECK(attention_mask.defined())
         << "LLaDA forward requires explicit 4D block attention mask";
 
-    for (auto& layer : layers_) {
-      hidden_states =
-          layer->forward(hidden_states, flat_positions, attention_mask);
+    const auto* dlm_runtime_params = input_params.dlm_params();
+    const bool use_history_cache =
+        dlm_runtime_params != nullptr && dlm_runtime_params->use_history_cache;
+    const bool update_history_cache = dlm_runtime_params != nullptr &&
+                                      dlm_runtime_params->update_history_cache;
+    const int32_t active_cache_length =
+        dlm_runtime_params != nullptr ? dlm_runtime_params->active_cache_length
+                                      : 0;
+    const int32_t cache_write_start =
+        dlm_runtime_params != nullptr ? dlm_runtime_params->cache_write_start
+                                      : 0;
+    const int32_t cache_write_end =
+        dlm_runtime_params != nullptr ? dlm_runtime_params->cache_write_end : 0;
+    if (kv_caches.size() < layers_.size()) {
+      kv_caches.resize(layers_.size());
+    }
+
+    for (size_t layer_id = 0; layer_id < layers_.size(); ++layer_id) {
+      hidden_states = layers_[layer_id]->forward(hidden_states,
+                                                 flat_positions,
+                                                 attention_mask,
+                                                 kv_caches[layer_id],
+                                                 active_cache_length,
+                                                 use_history_cache,
+                                                 update_history_cache,
+                                                 cache_write_start,
+                                                 cache_write_end);
     }
     auto norm_input = hidden_states;
     auto [final_hidden_states, residual] = norm_->forward(norm_input);

@@ -256,20 +256,28 @@ struct LlmRecMultiRoundParams {
   }
 };
 
-struct LLaDARecParams {
+struct DlmModelInputParams {
   int32_t prompt_length = 0;
   int32_t max_generated_tokens = 0;
+  int32_t committed_prefix_length = 0;
+  int32_t active_cache_length = 0;
+  int32_t cache_write_start = 0;
+  int32_t cache_write_end = 0;
+  bool use_history_cache = false;
+  bool update_history_cache = false;
 
-  LLaDARecParams to(const torch::Device& device) const {
+  DlmModelInputParams to(const torch::Device& device) const {
     (void)device;
     return *this;
   }
 };
 
+using LLaDARecParams = DlmModelInputParams;
+
 using RecModelInputParams = std::variant<std::monostate,
                                          OneRecModelInputParams,
                                          LlmRecMultiRoundParams,
-                                         LLaDARecParams>;
+                                         DlmModelInputParams>;
 
 enum class TransferType : uint8_t {
   G2H = 0,  // global memory(KVCache store) to host memory(DRAM)
@@ -431,8 +439,8 @@ struct ModelInputParams {
       params.rec_params = onerec->to(device);
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
-    } else if (const auto* llada = llada_params()) {
-      params.rec_params = llada->to(device);
+    } else if (const auto* dlm = dlm_params()) {
+      params.rec_params = dlm->to(device);
     }
 
     params.cp_prefill_inputs = cp_prefill_inputs.to(device);
@@ -464,10 +472,16 @@ struct ModelInputParams {
       LOG(INFO) << "ModelInputParams: has llm_rec_multi_round_params"
                 << ", beam_width=" << llmrec->beam_width
                 << ", total_round=" << llmrec->total_round;
-    } else if (const auto* llada = llada_params()) {
-      LOG(INFO) << "ModelInputParams: has llada_rec_params"
-                << ", prompt_length=" << llada->prompt_length
-                << ", max_generated_tokens=" << llada->max_generated_tokens;
+    } else if (const auto* dlm = dlm_params()) {
+      LOG(INFO) << "ModelInputParams: has dlm_rec_params"
+                << ", prompt_length=" << dlm->prompt_length
+                << ", max_generated_tokens=" << dlm->max_generated_tokens
+                << ", committed_prefix_length=" << dlm->committed_prefix_length
+                << ", active_cache_length=" << dlm->active_cache_length
+                << ", cache_write_range=[" << dlm->cache_write_start << ", "
+                << dlm->cache_write_end
+                << "), use_history_cache=" << dlm->use_history_cache
+                << ", update_history_cache=" << dlm->update_history_cache;
     }
   }
 
@@ -630,18 +644,24 @@ struct ModelInputParams {
     return std::get<LlmRecMultiRoundParams>(rec_params);
   }
 
-  const LLaDARecParams* llada_params() const {
-    return std::get_if<LLaDARecParams>(&rec_params);
+  const DlmModelInputParams* dlm_params() const {
+    return std::get_if<DlmModelInputParams>(&rec_params);
   }
 
-  bool has_llada_params() const { return llada_params() != nullptr; }
+  bool has_dlm_params() const { return dlm_params() != nullptr; }
 
-  LLaDARecParams& mutable_llada_params() {
-    if (!has_llada_params()) {
-      rec_params.emplace<LLaDARecParams>();
+  DlmModelInputParams& mutable_dlm_params() {
+    if (!has_dlm_params()) {
+      rec_params.emplace<DlmModelInputParams>();
     }
-    return std::get<LLaDARecParams>(rec_params);
+    return std::get<DlmModelInputParams>(rec_params);
   }
+
+  const LLaDARecParams* llada_params() const { return dlm_params(); }
+
+  bool has_llada_params() const { return has_dlm_params(); }
+
+  LLaDARecParams& mutable_llada_params() { return mutable_dlm_params(); }
 
   struct GraphBuffer {
     torch::Tensor attn_mask;

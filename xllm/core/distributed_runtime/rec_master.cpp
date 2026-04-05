@@ -79,25 +79,25 @@ bool validate_llada_request(
     OutputCallback callback) {
   if (sp.streaming) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: "
+                        "DLM request_validation failed: "
                         "streaming responses are unsupported");
     return false;
   }
   if (sp.beam_width > 1) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: "
+                        "DLM request_validation failed: "
                         "beam search is unsupported");
     return false;
   }
   if (sp.best_of.value_or(sp.n) != sp.n) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: "
+                        "DLM request_validation failed: "
                         "best_of must equal n");
     return false;
   }
   if (sp.logprobs || sp.top_logprobs > 0) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: "
+                        "DLM request_validation failed: "
                         "logprobs are unsupported");
     return false;
   }
@@ -105,23 +105,23 @@ bool validate_llada_request(
       sp.repetition_penalty != 1.0f) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
-        "LLaDA request_validation failed: penalties are unsupported");
+        "DLM request_validation failed: penalties are unsupported");
     return false;
   }
   if (sp.n != 1) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: n must equal 1");
+                        "DLM request_validation failed: n must equal 1");
     return false;
   }
   if (!sp.sample_slots.empty()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: sample_slots are "
+                        "DLM request_validation failed: sample_slots are "
                         "unsupported");
     return false;
   }
   if (input_tensors.has_value() && !input_tensors->empty()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "LLaDA request_validation failed: input_tensors are "
+                        "DLM request_validation failed: input_tensors are "
                         "unsupported");
     return false;
   }
@@ -541,9 +541,12 @@ std::shared_ptr<Request> RecMaster::LLaDARecMasterPipeline::generate_request(
   if (!validate_llada_request(sp, input_tensors, callback)) {
     return nullptr;
   }
-  LOG(INFO) << "LLaDA generate_request"
+  LOG(INFO) << "DLM generate_request"
             << ", model_type=" << master_.model_args_.model_type()
             << ", rec_type=" << static_cast<int32_t>(master_.rec_type())
+            << ", family="
+            << rec_model_family_to_string(get_rec_model_family(
+                   get_rec_model_kind(master_.model_args_.model_type())))
             << ", pipeline_type="
             << rec_pipeline_type_to_string(get_rec_pipeline_type(
                    get_rec_model_kind(master_.model_args_.model_type())))
@@ -589,7 +592,7 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
       return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecMasterPipeline>(master);
-    case RecPipelineType::kLLaDARecWorkerLoop:
+    case RecPipelineType::kDlmWorkerLoop:
       return std::make_unique<LLaDARecMasterPipeline>(master);
     default:
       LOG(FATAL) << "Unknown RecMaster pipeline type: "
@@ -637,12 +640,16 @@ RecMaster::RecMaster(const Options& options)
     }
     LOG(INFO) << "LLaDA master config"
               << ", model_type=" << model_args_.model_type()
-              << ", rec_type=" << static_cast<int32_t>(rec_type_)
+              << ", rec_type=" << static_cast<int32_t>(rec_type_) << ", family="
+              << rec_model_family_to_string(get_rec_model_family(
+                     get_rec_model_kind(model_args_.model_type())))
               << ", pipeline_type="
               << rec_pipeline_type_to_string(get_rec_pipeline_type(
                      get_rec_model_kind(model_args_.model_type())))
               << ", tp_size=" << devices.size() * options_.nnodes() << ", "
-              << llada_runtime_config_to_string(llada_runtime_config);
+              << dlm_runtime_config_to_string(get_dlm_runtime_config(
+                     get_rec_model_kind(model_args_.model_type())))
+              << ", " << llada_runtime_config_to_string(llada_runtime_config);
   }
 
   if (options_.enable_service_routing()) {
@@ -888,7 +895,7 @@ void RecMaster::schedule_request(RequestParams sp,
 
     if (request->state().rec_type == RecType::kLLaDARec) {
       const auto& sequence = request->sequences().front();
-      LOG(INFO) << "LLaDA request built"
+      LOG(INFO) << "DLM request built"
                 << ", request_id=" << request->request_id()
                 << ", prompt_tokens=" << sequence->num_prompt_tokens()
                 << ", max_tokens="
@@ -902,7 +909,7 @@ void RecMaster::schedule_request(RequestParams sp,
     }
 
     if (request->state().rec_type == RecType::kLLaDARec) {
-      LOG(INFO) << "LLaDA request enqueued"
+      LOG(INFO) << "DLM request enqueued"
                 << ", request_id=" << request->request_id();
     }
   });
@@ -933,8 +940,14 @@ std::shared_ptr<Request> RecMaster::build_request_common(
 
   uint32_t max_tokens = sp.max_tokens;
   if (max_tokens == 0) {
-    const uint32_t kDefaultMaxTokens = 5120;
-    max_tokens = kDefaultMaxTokens;
+    if (rec_type_ == RecType::kLLaDARec) {
+      max_tokens = static_cast<uint32_t>(
+          get_dlm_runtime_config(get_rec_model_kind(model_args_.model_type()))
+              .default_max_tokens);
+    } else {
+      const uint32_t kDefaultMaxTokens = 5120;
+      max_tokens = kDefaultMaxTokens;
+    }
   }
 
   size_t capacity = prompt_tokens.size() + max_tokens +

@@ -26,6 +26,7 @@ limitations under the License.
 #include "common/partial_rotary_embedding.h"
 #include "common/qwen3_next_rms_norm.h"
 #include "common/rms_norm.h"
+#include "framework/kv_cache/kv_cache.h"
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 
@@ -36,7 +37,7 @@ class LLaDA2MoeGateImpl : public torch::nn::Module {
  public:
   explicit LLaDA2MoeGateImpl(const ModelContext& context);
 
-  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(
+  std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& hidden_states);
 
   void load_state_dict(const StateDict& state_dict);
@@ -69,6 +70,8 @@ class LLaDA2SparseMoeBlockImpl : public torch::nn::Module {
   void verify_loaded_weights(const std::string& prefix) const;
 
  private:
+  torch::Tensor forward_npu_fused(const torch::Tensor& hidden_states);
+
   int64_t hidden_size_ = 0;
   int64_t moe_intermediate_size_ = 0;
   int64_t num_experts_ = 0;
@@ -99,7 +102,13 @@ class LLaDA2AttentionImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& positions,
-                        const torch::Tensor& attention_mask);
+                        const torch::Tensor& attention_mask,
+                        KVCache& kv_cache,
+                        int32_t active_cache_length,
+                        bool use_history_cache,
+                        bool update_history_cache,
+                        int32_t cache_write_start,
+                        int32_t cache_write_end);
 
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights(const std::string& prefix) const;
@@ -112,11 +121,13 @@ class LLaDA2AttentionImpl : public torch::nn::Module {
   int64_t num_heads_ = 0;
   int64_t num_kv_heads_ = 0;
   int64_t num_kv_head_replicas_ = 1;
+  int64_t attn_num_kv_repeats_ = 1;
   int64_t head_dim_ = 0;
   int64_t total_q_size_ = 0;
   int64_t total_kv_size_ = 0;
   int64_t q_size_ = 0;
   int64_t kv_size_ = 0;
+  int64_t max_position_embeddings_ = 0;
   float scaling_ = 1.0f;
   bool use_qk_norm_ = false;
   bool qkv_bias_ = false;
@@ -142,7 +153,13 @@ class LLaDA2MoeDecoderLayerImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& positions,
-                        const torch::Tensor& attention_mask);
+                        const torch::Tensor& attention_mask,
+                        KVCache& kv_cache,
+                        int32_t active_cache_length,
+                        bool use_history_cache,
+                        bool update_history_cache,
+                        int32_t cache_write_start,
+                        int32_t cache_write_end);
 
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights(const std::string& prefix) const;

@@ -177,7 +177,7 @@ TEST(HFModelLoaderTest, LLaDAResolveModelRegistration) {
 TEST(HFModelLoaderTest, LLaDARecModelKindAndPipelineType) {
   EXPECT_EQ(get_rec_model_kind("llada2_moe"), RecModelKind::kLLaDARec);
   EXPECT_EQ(get_rec_pipeline_type(RecModelKind::kLLaDARec),
-            RecPipelineType::kLLaDARecWorkerLoop);
+            RecPipelineType::kDlmWorkerLoop);
   EXPECT_EQ(ModelRegistry::get_model_backend("llada2_moe"), "rec");
 }
 
@@ -202,6 +202,10 @@ TEST(HFModelLoaderTest, LLaDARuntimeConfigRejectsInvalidRanges) {
   config = get_llada_runtime_config();
   config.mask_id = 42;
   EXPECT_FALSE(validate_llada_runtime_config(config, 42, &error_message));
+
+  config = get_llada_runtime_config();
+  config.penalty_lambda = -1.0;
+  EXPECT_FALSE(validate_llada_runtime_config(config, -1, &error_message));
 }
 
 TEST(HFModelLoaderTest, LLaDAModelArgsLoader) {

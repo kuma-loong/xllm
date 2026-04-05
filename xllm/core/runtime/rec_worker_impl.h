@@ -276,17 +276,15 @@ class RecWorkerImpl : public LLMWorkerImpl {
     int32_t beam_width_;
   };
 
-  class LLaDARecWorkPipeline final : public RecWorkPipeline {
+  class DlmDecodePipeline final : public RecWorkPipeline {
    public:
-    explicit LLaDARecWorkPipeline(RecPipelineRuntime& runtime)
+    explicit DlmDecodePipeline(RecPipelineRuntime& runtime)
         : RecWorkPipeline(runtime) {}
 
     ForwardInput prepare_inputs(Batch& batch) override;
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
    private:
-    torch::Tensor build_attention_mask(int32_t active_length,
-                                       int32_t block_length) const;
     torch::Tensor initialize_tokens(const ForwardInput& input,
                                     int32_t prompt_length,
                                     int32_t total_length,

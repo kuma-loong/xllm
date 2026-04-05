@@ -15,14 +15,21 @@ limitations under the License.
 
 #include "llada2_moe_decoder_layer.h"
 
+#include <array>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "framework/parallel_state/parallel_state.h"
+#include "kernels/ops_api.h"
+#if defined(USE_NPU)
+#include "kernels/npu/npu_ops_api.h"
+#endif
+#include "models/rec/llada_dlm_cache.h"
 
 namespace xllm {
 namespace layer {
@@ -130,8 +137,8 @@ LLaDA2MoeGateImpl::LLaDA2MoeGateImpl(const ModelContext& context)
   }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-LLaDA2MoeGateImpl::forward(const torch::Tensor& hidden_states) {
+std::tuple<torch::Tensor, torch::Tensor> LLaDA2MoeGateImpl::forward(
+    const torch::Tensor& hidden_states) {
   auto logits = gate_->forward(hidden_states).to(torch::kFloat32);
   auto scores = torch::sigmoid(logits);
   auto scores_for_routing = scores;
@@ -172,7 +179,7 @@ LLaDA2MoeGateImpl::forward(const torch::Tensor& hidden_states) {
         topk_weight / (topk_weight.sum(/*dim=*/-1, /*keepdim=*/true) + 1e-20);
   }
   topk_weight = topk_weight * routed_scaling_factor_;
-  return {topk_idx, topk_weight, logits};
+  return {topk_idx, topk_weight};
 }
 
 void LLaDA2MoeGateImpl::load_state_dict(const StateDict& state_dict) {
@@ -251,8 +258,10 @@ LLaDA2SparseMoeBlockImpl::LLaDA2SparseMoeBlockImpl(const ModelContext& context)
 
 torch::Tensor LLaDA2SparseMoeBlockImpl::forward(
     const torch::Tensor& hidden_states) {
-  auto [topk_idx, topk_weight, router_logits] = gate_->forward(hidden_states);
-  (void)router_logits;
+#if defined(USE_NPU)
+  return forward_npu_fused(hidden_states);
+#else
+  auto [topk_idx, topk_weight] = gate_->forward(hidden_states);
 
   auto local_output = torch::zeros({hidden_states.size(0), hidden_size_},
                                    hidden_states.options());
@@ -291,6 +300,87 @@ torch::Tensor LLaDA2SparseMoeBlockImpl::forward(
     local_output = parallel_state::reduce(local_output, tp_group_);
   }
   return local_output;
+#endif
+}
+
+torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_fused(
+    const torch::Tensor& hidden_states) {
+  auto [topk_idx, topk_weight] = gate_->forward(hidden_states);
+
+  std::optional<torch::Tensor> shared_output = std::nullopt;
+  if (shared_experts_) {
+    shared_output = shared_experts_->forward(hidden_states);
+  }
+
+  auto hidden_states_2d = hidden_states.reshape({-1, hidden_size_});
+  auto expert_idx = topk_idx.to(torch::kInt32).contiguous();
+  auto reduce_weight = topk_weight.to(torch::kFloat32).contiguous();
+  const std::array<int64_t, 2> active_expert_range = {0, num_experts_};
+
+  xllm::kernel::MoeInitRoutingV2Params moe_init_routing_params;
+  moe_init_routing_params.x = hidden_states_2d;
+  moe_init_routing_params.expert_idx = expert_idx;
+  moe_init_routing_params.scale = std::nullopt;
+  moe_init_routing_params.offset = std::nullopt;
+  moe_init_routing_params.active_num =
+      hidden_states_2d.size(0) * expert_idx.size(1);
+  moe_init_routing_params.expert_capacity = 0;
+  moe_init_routing_params.expert_num = num_experts_;
+  moe_init_routing_params.drop_pad_mode = 0;
+  moe_init_routing_params.expert_tokens_num_type = 1;
+  moe_init_routing_params.expert_tokens_num_flag = true;
+  moe_init_routing_params.row_idx_type = 0;
+  moe_init_routing_params.quant_mode = -1;
+  moe_init_routing_params.active_expert_range = active_expert_range;
+
+  auto [expand_hidden_states, expand_row_ids, group_list, dynamic_scale] =
+      xllm::kernel::moe_init_routing_v2(moe_init_routing_params);
+  (void)dynamic_scale;
+
+  xllm::kernel::GroupGemmParams gemm1_params;
+  gemm1_params.a = expand_hidden_states;
+  gemm1_params.b = w13_;
+  if (gemm1_params.b.size(1) != expand_hidden_states.size(1)) {
+    gemm1_params.b = gemm1_params.b.transpose(1, 2);
+  }
+  gemm1_params.group_list = group_list;
+  gemm1_params.split_item = 2;
+  gemm1_params.group_type = 0;
+  gemm1_params.group_list_type = 1;
+  auto gemm1_out = xllm::kernel::group_gemm(gemm1_params);
+
+  xllm::kernel::ActivationParams activation_params;
+  activation_params.input = gemm1_out;
+  activation_params.act_mode = hidden_act_;
+  activation_params.is_gated = true;
+  xllm::kernel::active(activation_params);
+  auto act_out = activation_params.output;
+
+  xllm::kernel::GroupGemmParams gemm2_params;
+  gemm2_params.a = act_out;
+  gemm2_params.b = w2_;
+  if (gemm2_params.b.size(1) != act_out.size(1)) {
+    gemm2_params.b = gemm2_params.b.transpose(1, 2);
+  }
+  gemm2_params.group_list = group_list;
+  gemm2_params.split_item = 2;
+  gemm2_params.group_type = 0;
+  gemm2_params.group_list_type = 1;
+  auto gemm2_out = xllm::kernel::group_gemm(gemm2_params);
+
+  xllm::kernel::MoeCombineResultParams moe_combine_params;
+  moe_combine_params.input = gemm2_out;
+  moe_combine_params.reduce_weight = reduce_weight;
+  moe_combine_params.gather_ids = expand_row_ids;
+  auto output = xllm::kernel::moe_combine_result(moe_combine_params)
+                    .reshape(hidden_states.sizes());
+  if (shared_output.has_value()) {
+    output = output + shared_output.value();
+  }
+  if (tp_world_size_ > 1) {
+    output = parallel_state::reduce(output, tp_group_);
+  }
+  return output;
 }
 
 void LLaDA2SparseMoeBlockImpl::load_state_dict(const StateDict& state_dict) {
@@ -404,12 +494,16 @@ LLaDA2AttentionImpl::LLaDA2AttentionImpl(const ModelContext& context)
     num_kv_heads_ = 1;
     num_kv_head_replicas_ = tp_world_size_ / total_num_kv_heads_;
   }
+  CHECK_EQ(num_heads_ % num_kv_heads_, 0)
+      << "Local attention heads must be divisible by local kv heads.";
+  attn_num_kv_repeats_ = num_heads_ / num_kv_heads_;
 
   head_dim_ = args.head_dim();
   total_q_size_ = total_num_heads_ * head_dim_;
   total_kv_size_ = total_num_kv_heads_ * head_dim_;
   q_size_ = num_heads_ * head_dim_;
   kv_size_ = num_kv_heads_ * head_dim_;
+  max_position_embeddings_ = args.max_position_embeddings();
   scaling_ = 1.0f / std::sqrt(static_cast<float>(head_dim_));
   use_qk_norm_ = args.use_qk_norm();
   qkv_bias_ = args.qkv_bias();
@@ -454,10 +548,15 @@ LLaDA2AttentionImpl::LLaDA2AttentionImpl(const ModelContext& context)
           options));
 }
 
-torch::Tensor LLaDA2AttentionImpl::forward(
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& positions,
-    const torch::Tensor& attention_mask) {
+torch::Tensor LLaDA2AttentionImpl::forward(const torch::Tensor& hidden_states,
+                                           const torch::Tensor& positions,
+                                           const torch::Tensor& attention_mask,
+                                           KVCache& kv_cache,
+                                           int32_t active_cache_length,
+                                           bool use_history_cache,
+                                           bool update_history_cache,
+                                           int32_t cache_write_start,
+                                           int32_t cache_write_end) {
   auto qkv = qkv_proj_->forward(hidden_states);
   auto q = qkv.slice(/*dim=*/-1, 0, q_size_);
   auto k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
@@ -476,27 +575,68 @@ torch::Tensor LLaDA2AttentionImpl::forward(
 
   auto query_states =
       q.view({1, seq_len, num_heads_, head_dim_}).transpose(1, 2);
-  auto key_states =
+  auto current_key_states =
       k.view({1, seq_len, num_kv_heads_, head_dim_}).transpose(1, 2);
-  auto value_states =
+  auto current_value_states =
       v.view({1, seq_len, num_kv_heads_, head_dim_}).transpose(1, 2);
-  key_states = repeat_kv(key_states, num_kv_head_replicas_);
-  value_states = repeat_kv(value_states, num_kv_head_replicas_);
-
-  auto scores = torch::matmul(query_states, key_states.transpose(-2, -1));
-  scores = scores * scaling_;
+  auto key_states = current_key_states;
+  auto value_states = current_value_states;
+  if ((use_history_cache || update_history_cache) &&
+      cache_write_end > cache_write_start) {
+    CHECK_GE(cache_write_start, 0)
+        << "LLaDA cache_write_start must be non-negative";
+    CHECK_GT(cache_write_end, cache_write_start)
+        << "LLaDA cache_write_end must be greater than cache_write_start";
+    CHECK_LE(cache_write_end, max_position_embeddings_)
+        << "LLaDA cache_write_end exceeds max_position_embeddings";
+    LLaDAHistoryCacheRange cache_range;
+    cache_range.start = cache_write_start;
+    cache_range.end = cache_write_end;
+    cache_range.active_length = std::max(active_cache_length, cache_write_end);
+    std::tie(key_states, value_states) =
+        LLaDAHistoryCache::materialize_attention_kv(kv_cache,
+                                                    current_key_states,
+                                                    current_value_states,
+                                                    cache_range,
+                                                    update_history_cache);
+  } else if (update_history_cache || use_history_cache) {
+    kv_cache = KVCache(current_key_states.contiguous(),
+                       current_value_states.contiguous());
+  }
 
   auto attn_mask = normalize_attention_mask(attention_mask)
-                       .to(scores.device())
-                       .to(scores.dtype());
+                       .to(query_states.device())
+                       .to(query_states.dtype());
   if (attn_mask.size(-1) != key_states.size(-2)) {
     attn_mask = attn_mask.slice(/*dim=*/-1, 0, key_states.size(-2));
   }
-  scores = scores + attn_mask;
-
-  auto attn_weights =
-      torch::softmax(scores.to(torch::kFloat32), /*dim=*/-1).to(scores.dtype());
-  auto attn_output = torch::matmul(attn_weights, value_states);
+#if defined(USE_NPU)
+  const bool can_use_npu_batch_prefill = !use_history_cache &&
+                                         !update_history_cache &&
+                                         cache_write_end <= cache_write_start;
+  if (can_use_npu_batch_prefill) {
+    auto query_3d = q.view({seq_len, num_heads_, head_dim_});
+    auto key_3d = key_states.squeeze(0).transpose(0, 1).contiguous();
+    auto value_3d = value_states.squeeze(0).transpose(0, 1).contiguous();
+    auto output_3d = torch::empty_like(query_3d);
+    auto kv_seq_lens_host =
+        torch::tensor({static_cast<int32_t>(key_3d.size(0))},
+                      torch::TensorOptions().dtype(torch::kInt));
+    xllm::kernel::npu::batch_prefill(query_3d,
+                                     key_3d,
+                                     value_3d,
+                                     attn_mask,
+                                     kv_seq_lens_host,
+                                     scaling_,
+                                     output_3d);
+    auto attn_output = output_3d.reshape({seq_len, q_size_});
+    return o_proj_->forward(attn_output);
+  }
+#endif
+  key_states = repeat_kv(key_states, attn_num_kv_repeats_);
+  value_states = repeat_kv(value_states, attn_num_kv_repeats_);
+  auto attn_output = at::scaled_dot_product_attention(
+      query_states, key_states, value_states, attn_mask, 0.0, false);
   attn_output =
       attn_output.transpose(1, 2).contiguous().reshape({seq_len, q_size_});
   return o_proj_->forward(attn_output);
@@ -615,11 +755,25 @@ LLaDA2MoeDecoderLayerImpl::LLaDA2MoeDecoderLayerImpl(
 torch::Tensor LLaDA2MoeDecoderLayerImpl::forward(
     const torch::Tensor& hidden_states,
     const torch::Tensor& positions,
-    const torch::Tensor& attention_mask) {
+    const torch::Tensor& attention_mask,
+    KVCache& kv_cache,
+    int32_t active_cache_length,
+    bool use_history_cache,
+    bool update_history_cache,
+    int32_t cache_write_start,
+    int32_t cache_write_end) {
   auto residual = hidden_states;
   auto norm_input = hidden_states;
   auto x = std::get<0>(input_norm_->forward(norm_input));
-  x = attention_->forward(x, positions, attention_mask);
+  x = attention_->forward(x,
+                          positions,
+                          attention_mask,
+                          kv_cache,
+                          active_cache_length,
+                          use_history_cache,
+                          update_history_cache,
+                          cache_write_start,
+                          cache_write_end);
   x = residual + x;
 
   residual = x;
