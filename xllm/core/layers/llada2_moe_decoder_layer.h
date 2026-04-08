@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/qwen3_next_rms_norm.h"
 #include "common/rms_norm.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 
@@ -70,7 +71,10 @@ class LLaDA2SparseMoeBlockImpl : public torch::nn::Module {
   void verify_loaded_weights(const std::string& prefix) const;
 
  private:
-  torch::Tensor forward_npu_fused(const torch::Tensor& hidden_states);
+#if defined(USE_NPU)
+  torch::Tensor forward_npu_llada_grouped_moe(
+      const torch::Tensor& hidden_states);
+#endif
 
   int64_t hidden_size_ = 0;
   int64_t moe_intermediate_size_ = 0;
@@ -107,6 +111,9 @@ class LLaDA2AttentionImpl : public torch::nn::Module {
                         int32_t active_cache_length,
                         bool use_history_cache,
                         bool update_history_cache,
+                        int32_t block_offset,
+                        int32_t block_length,
+                        DlmModelInputParams::ReqPhase req_phase,
                         int32_t cache_write_start,
                         int32_t cache_write_end);
 
@@ -158,6 +165,9 @@ class LLaDA2MoeDecoderLayerImpl : public torch::nn::Module {
                         int32_t active_cache_length,
                         bool use_history_cache,
                         bool update_history_cache,
+                        int32_t block_offset,
+                        int32_t block_length,
+                        DlmModelInputParams::ReqPhase req_phase,
                         int32_t cache_write_start,
                         int32_t cache_write_end);
 

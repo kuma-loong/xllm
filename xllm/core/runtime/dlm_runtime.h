@@ -42,9 +42,13 @@ enum class DlmForwardMode : uint8_t {
 
 struct DlmForwardBatch {
   DlmForwardMode forward_mode = DlmForwardMode::kPrefill;
+  DlmModelInputParams::ReqPhase req_phase =
+      DlmModelInputParams::ReqPhase::kIncomingPrefill;
   torch::Tensor tokens;
   torch::Tensor positions;
   torch::Tensor attention_mask;
+  int32_t block_offset = 0;
+  int32_t block_length = 0;
   DlmBlockRange cache_write_range;
   int32_t committed_prefix_length = 0;
   int32_t active_cache_length = 0;
@@ -63,6 +67,9 @@ inline ModelInputParams make_dlm_model_input_params(
   auto& dlm_params = input_params.mutable_dlm_params();
   dlm_params.committed_prefix_length = forward_batch.committed_prefix_length;
   dlm_params.active_cache_length = forward_batch.active_cache_length;
+  dlm_params.block_offset = forward_batch.block_offset;
+  dlm_params.block_length = forward_batch.block_length;
+  dlm_params.req_phase = forward_batch.req_phase;
   dlm_params.cache_write_start = forward_batch.cache_write_range.start;
   dlm_params.cache_write_end = forward_batch.cache_write_range.end;
   dlm_params.use_history_cache = forward_batch.use_cache;
@@ -167,16 +174,9 @@ class DlmDecodeAlgorithm {
            config_.block_length;
   }
 
-  torch::Tensor build_prompt_mask_in_block(const torch::TensorOptions& options,
-                                           const DlmBlockRange& block,
-                                           int32_t prompt_length) const {
-    torch::Tensor prompt_mask = torch::zeros({block.length()}, options);
-    if (block.start < prompt_length) {
-      const int32_t prompt_end_in_block =
-          std::min(prompt_length - block.start, block.length());
-      prompt_mask.slice(0, 0, prompt_end_in_block).fill_(true);
-    }
-    return prompt_mask;
+  torch::Tensor build_prompt_mask_in_block(
+      const torch::Tensor& initial_block_tokens) const {
+    return initial_block_tokens.eq(config_.mask_id).logical_not();
   }
 
   void apply_penalty(torch::Tensor& logits,

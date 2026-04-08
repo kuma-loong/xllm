@@ -259,7 +259,7 @@ LLaDA2SparseMoeBlockImpl::LLaDA2SparseMoeBlockImpl(const ModelContext& context)
 torch::Tensor LLaDA2SparseMoeBlockImpl::forward(
     const torch::Tensor& hidden_states) {
 #if defined(USE_NPU)
-  return forward_npu_fused(hidden_states);
+  return forward_npu_llada_grouped_moe(hidden_states);
 #else
   auto [topk_idx, topk_weight] = gate_->forward(hidden_states);
 
@@ -303,7 +303,8 @@ torch::Tensor LLaDA2SparseMoeBlockImpl::forward(
 #endif
 }
 
-torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_fused(
+#if defined(USE_NPU)
+torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_llada_grouped_moe(
     const torch::Tensor& hidden_states) {
   auto [topk_idx, topk_weight] = gate_->forward(hidden_states);
 
@@ -317,24 +318,23 @@ torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_fused(
   auto reduce_weight = topk_weight.to(torch::kFloat32).contiguous();
   const std::array<int64_t, 2> active_expert_range = {0, num_experts_};
 
-  xllm::kernel::MoeInitRoutingV2Params moe_init_routing_params;
-  moe_init_routing_params.x = hidden_states_2d;
-  moe_init_routing_params.expert_idx = expert_idx;
-  moe_init_routing_params.scale = std::nullopt;
-  moe_init_routing_params.offset = std::nullopt;
-  moe_init_routing_params.active_num =
-      hidden_states_2d.size(0) * expert_idx.size(1);
-  moe_init_routing_params.expert_capacity = 0;
-  moe_init_routing_params.expert_num = num_experts_;
-  moe_init_routing_params.drop_pad_mode = 0;
-  moe_init_routing_params.expert_tokens_num_type = 1;
-  moe_init_routing_params.expert_tokens_num_flag = true;
-  moe_init_routing_params.row_idx_type = 0;
-  moe_init_routing_params.quant_mode = -1;
-  moe_init_routing_params.active_expert_range = active_expert_range;
+  xllm::kernel::MoeInitRoutingV2Params routing_params;
+  routing_params.x = hidden_states_2d;
+  routing_params.expert_idx = expert_idx;
+  routing_params.scale = std::nullopt;
+  routing_params.offset = std::nullopt;
+  routing_params.active_num = hidden_states_2d.size(0) * expert_idx.size(1);
+  routing_params.expert_capacity = 0;
+  routing_params.expert_num = num_experts_;
+  routing_params.drop_pad_mode = 0;
+  routing_params.expert_tokens_num_type = 1;
+  routing_params.expert_tokens_num_flag = true;
+  routing_params.row_idx_type = 0;
+  routing_params.quant_mode = -1;
+  routing_params.active_expert_range = active_expert_range;
 
   auto [expand_hidden_states, expand_row_ids, group_list, dynamic_scale] =
-      xllm::kernel::moe_init_routing_v2(moe_init_routing_params);
+      xllm::kernel::moe_init_routing_v2(routing_params);
   (void)dynamic_scale;
 
   xllm::kernel::GroupGemmParams gemm1_params;
@@ -368,11 +368,11 @@ torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_fused(
   gemm2_params.group_list_type = 1;
   auto gemm2_out = xllm::kernel::group_gemm(gemm2_params);
 
-  xllm::kernel::MoeCombineResultParams moe_combine_params;
-  moe_combine_params.input = gemm2_out;
-  moe_combine_params.reduce_weight = reduce_weight;
-  moe_combine_params.gather_ids = expand_row_ids;
-  auto output = xllm::kernel::moe_combine_result(moe_combine_params)
+  xllm::kernel::MoeCombineResultParams combine_params;
+  combine_params.input = gemm2_out;
+  combine_params.reduce_weight = reduce_weight;
+  combine_params.gather_ids = expand_row_ids;
+  auto output = xllm::kernel::moe_combine_result(combine_params)
                     .reshape(hidden_states.sizes());
   if (shared_output.has_value()) {
     output = output + shared_output.value();
@@ -382,6 +382,7 @@ torch::Tensor LLaDA2SparseMoeBlockImpl::forward_npu_fused(
   }
   return output;
 }
+#endif
 
 void LLaDA2SparseMoeBlockImpl::load_state_dict(const StateDict& state_dict) {
   auto gate_state_dict = state_dict.get_dict_with_prefix("gate.");
@@ -548,15 +549,19 @@ LLaDA2AttentionImpl::LLaDA2AttentionImpl(const ModelContext& context)
           options));
 }
 
-torch::Tensor LLaDA2AttentionImpl::forward(const torch::Tensor& hidden_states,
-                                           const torch::Tensor& positions,
-                                           const torch::Tensor& attention_mask,
-                                           KVCache& kv_cache,
-                                           int32_t active_cache_length,
-                                           bool use_history_cache,
-                                           bool update_history_cache,
-                                           int32_t cache_write_start,
-                                           int32_t cache_write_end) {
+torch::Tensor LLaDA2AttentionImpl::forward(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& positions,
+    const torch::Tensor& attention_mask,
+    KVCache& kv_cache,
+    int32_t active_cache_length,
+    bool use_history_cache,
+    bool update_history_cache,
+    int32_t block_offset,
+    int32_t block_length,
+    DlmModelInputParams::ReqPhase req_phase,
+    int32_t cache_write_start,
+    int32_t cache_write_end) {
   auto qkv = qkv_proj_->forward(hidden_states);
   auto q = qkv.slice(/*dim=*/-1, 0, q_size_);
   auto k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
@@ -571,6 +576,18 @@ torch::Tensor LLaDA2AttentionImpl::forward(const torch::Tensor& hidden_states,
   }
 
   auto rope_positions = positions.reshape({-1});
+  const bool is_dllm_phase =
+      req_phase == DlmModelInputParams::ReqPhase::kIncomingPrefill ||
+      req_phase == DlmModelInputParams::ReqPhase::kIncomingDecode ||
+      req_phase == DlmModelInputParams::ReqPhase::kStagingPrefill ||
+      req_phase == DlmModelInputParams::ReqPhase::kStagingDecode;
+  if (is_dllm_phase && block_length > 0 && seq_len == block_length) {
+    rope_positions = torch::arange(block_offset,
+                                   block_offset + seq_len,
+                                   torch::TensorOptions()
+                                       .device(positions.device())
+                                       .dtype(positions.dtype()));
+  }
   rotary_emb_->forward(rope_positions, q, k);
 
   auto query_states =
@@ -611,9 +628,12 @@ torch::Tensor LLaDA2AttentionImpl::forward(const torch::Tensor& hidden_states,
     attn_mask = attn_mask.slice(/*dim=*/-1, 0, key_states.size(-2));
   }
 #if defined(USE_NPU)
-  const bool can_use_npu_batch_prefill = !use_history_cache &&
-                                         !update_history_cache &&
-                                         cache_write_end <= cache_write_start;
+  const bool is_prefill_phase =
+      req_phase == DlmModelInputParams::ReqPhase::kIncomingPrefill ||
+      req_phase == DlmModelInputParams::ReqPhase::kStagingPrefill;
+  const bool can_use_npu_batch_prefill =
+      is_prefill_phase && !use_history_cache && !update_history_cache &&
+      cache_write_end <= cache_write_start;
   if (can_use_npu_batch_prefill) {
     auto query_3d = q.view({seq_len, num_heads_, head_dim_});
     auto key_3d = key_states.squeeze(0).transpose(0, 1).contiguous();
@@ -760,6 +780,9 @@ torch::Tensor LLaDA2MoeDecoderLayerImpl::forward(
     int32_t active_cache_length,
     bool use_history_cache,
     bool update_history_cache,
+    int32_t block_offset,
+    int32_t block_length,
+    DlmModelInputParams::ReqPhase req_phase,
     int32_t cache_write_start,
     int32_t cache_write_end) {
   auto residual = hidden_states;
@@ -772,6 +795,9 @@ torch::Tensor LLaDA2MoeDecoderLayerImpl::forward(
                           active_cache_length,
                           use_history_cache,
                           update_history_cache,
+                          block_offset,
+                          block_length,
+                          req_phase,
                           cache_write_start,
                           cache_write_end);
   x = residual + x;

@@ -98,6 +98,14 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
                                       : 0;
     const int32_t cache_write_end =
         dlm_runtime_params != nullptr ? dlm_runtime_params->cache_write_end : 0;
+    const int32_t block_offset =
+        dlm_runtime_params != nullptr ? dlm_runtime_params->block_offset : 0;
+    const int32_t block_length =
+        dlm_runtime_params != nullptr ? dlm_runtime_params->block_length : 0;
+    const auto req_phase =
+        dlm_runtime_params != nullptr
+            ? dlm_runtime_params->req_phase
+            : DlmModelInputParams::ReqPhase::kIncomingPrefill;
     if (kv_caches.size() < layers_.size()) {
       kv_caches.resize(layers_.size());
     }
@@ -110,6 +118,9 @@ class LLaDA2MoeModelImpl final : public torch::nn::Module {
                                                  active_cache_length,
                                                  use_history_cache,
                                                  update_history_cache,
+                                                 block_offset,
+                                                 block_length,
+                                                 req_phase,
                                                  cache_write_start,
                                                  cache_write_end);
     }

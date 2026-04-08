@@ -257,8 +257,18 @@ struct LlmRecMultiRoundParams {
 };
 
 struct DlmModelInputParams {
+  enum class ReqPhase : int32_t {
+    kStagingPrefill = 0,
+    kStagingDecode = 1,
+    kIncomingPrefill = 2,
+    kIncomingDecode = 3,
+  };
+
   int32_t prompt_length = 0;
   int32_t max_generated_tokens = 0;
+  int32_t block_offset = 0;
+  int32_t block_length = 0;
+  ReqPhase req_phase = ReqPhase::kIncomingPrefill;
   int32_t committed_prefix_length = 0;
   int32_t active_cache_length = 0;
   int32_t cache_write_start = 0;
@@ -476,6 +486,9 @@ struct ModelInputParams {
       LOG(INFO) << "ModelInputParams: has dlm_rec_params"
                 << ", prompt_length=" << dlm->prompt_length
                 << ", max_generated_tokens=" << dlm->max_generated_tokens
+                << ", block_offset=" << dlm->block_offset
+                << ", block_length=" << dlm->block_length
+                << ", req_phase=" << static_cast<int32_t>(dlm->req_phase)
                 << ", committed_prefix_length=" << dlm->committed_prefix_length
                 << ", active_cache_length=" << dlm->active_cache_length
                 << ", cache_write_range=[" << dlm->cache_write_start << ", "

@@ -252,18 +252,43 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
             << ", worker_cache_path="
             << (enable_prefix_cache ? "local_prefix_cache" : "disabled");
 
+  auto run_forward_full_logits = [&](const torch::Tensor& forward_tokens,
+                                     const torch::Tensor& forward_positions,
+                                     std::vector<KVCache>& forward_kv_caches,
+                                     const ModelInputParams& model_input_params,
+                                     int32_t expected_tokens) -> torch::Tensor {
+    auto model_output = runtime_.model->forward(forward_tokens.reshape({-1}),
+                                                forward_positions.reshape({-1}),
+                                                forward_kv_caches,
+                                                model_input_params);
+    torch::Tensor logits =
+        runtime_.model->logits(model_output.hidden_states, torch::Tensor());
+    CHECK_EQ(logits.size(0), expected_tokens)
+        << "DLM requires full-block logits, but got " << logits.size(0)
+        << " tokens for expected " << expected_tokens;
+    return logits.view({1, expected_tokens, -1});
+  };
+
   auto run_cached_block_forward = [&](const torch::Tensor& block_tokens,
                                       const torch::Tensor& block_positions,
                                       const DlmBlockRange& cache_write_range,
+                                      DlmModelInputParams::ReqPhase req_phase,
                                       bool update_cache) -> torch::Tensor {
     const int32_t active_cache_length =
         prefix_cache_manager.active_length_for(cache_write_range);
     DlmForwardBatch forward_batch;
-    forward_batch.forward_mode = DlmForwardMode::kDecode;
+    const bool is_prefill_phase =
+        req_phase == DlmModelInputParams::ReqPhase::kIncomingPrefill ||
+        req_phase == DlmModelInputParams::ReqPhase::kStagingPrefill;
+    forward_batch.forward_mode =
+        is_prefill_phase ? DlmForwardMode::kPrefill : DlmForwardMode::kDecode;
+    forward_batch.req_phase = req_phase;
     forward_batch.tokens = block_tokens;
     forward_batch.positions = block_positions;
     forward_batch.attention_mask = build_dlm_visible_attention_mask(
         device, block_tokens.size(1), active_cache_length);
+    forward_batch.block_offset = cache_write_range.start;
+    forward_batch.block_length = block_length;
     forward_batch.cache_write_range = cache_write_range;
     forward_batch.committed_prefix_length =
         prefix_cache_manager.committed_prefix_length();
@@ -273,36 +298,40 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
     forward_batch.update_cache = update_cache;
     ModelInputParams model_input_params =
         make_dlm_model_input_params(forward_batch);
-    auto model_output =
-        runtime_.model->forward(block_tokens.reshape({-1}),
-                                block_positions.reshape({-1}),
+    torch::Tensor block_logits =
+        run_forward_full_logits(block_tokens,
+                                block_positions,
                                 prefix_cache_manager.mutable_caches(),
-                                model_input_params);
+                                model_input_params,
+                                block_tokens.size(1));
     if (update_cache) {
       prefix_cache_manager.mark_prefix_committed(cache_write_range);
       ++total_cache_updates;
     }
-    return runtime_.model->logits(model_output.hidden_states, torch::Tensor())
-        .view({1, block_tokens.size(1), -1});
+    return block_logits;
   };
 
   auto run_full_window_forward =
       [&](const torch::Tensor& window_tokens,
           const torch::Tensor& window_positions,
+          DlmModelInputParams::ReqPhase req_phase,
+          int32_t block_offset,
           const torch::Tensor& attention_mask) -> torch::Tensor {
     DlmForwardBatch forward_batch;
     forward_batch.forward_mode = DlmForwardMode::kPrefill;
+    forward_batch.req_phase = req_phase;
     forward_batch.tokens = window_tokens;
     forward_batch.positions = window_positions;
     forward_batch.attention_mask = attention_mask;
+    forward_batch.block_offset = block_offset;
+    forward_batch.block_length = block_length;
     ModelInputParams model_input_params =
         make_dlm_model_input_params(forward_batch);
-    auto model_output = runtime_.model->forward(window_tokens.reshape({-1}),
-                                                window_positions.reshape({-1}),
-                                                no_cache_kv_caches,
-                                                model_input_params);
-    return runtime_.model->logits(model_output.hidden_states, torch::Tensor())
-        .view({1, window_tokens.size(1), -1});
+    return run_forward_full_logits(window_tokens,
+                                   window_positions,
+                                   no_cache_kv_caches,
+                                   model_input_params,
+                                   window_tokens.size(1));
   };
 
   if (enable_prefix_cache) {
@@ -313,9 +342,13 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
           x.slice(1, prompt_block_range.start, prompt_block_range.end).clone();
       torch::Tensor prompt_positions = position_ids.slice(
           1, prompt_block_range.start, prompt_block_range.end);
+      DlmModelInputParams::ReqPhase prompt_phase =
+          block_id == 0 ? DlmModelInputParams::ReqPhase::kIncomingPrefill
+                        : DlmModelInputParams::ReqPhase::kStagingPrefill;
       (void)run_cached_block_forward(prompt_block,
                                      prompt_positions,
                                      prompt_block_range,
+                                     prompt_phase,
                                      /*update_history_cache=*/true);
     }
   }
@@ -340,6 +373,26 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
     int32_t refine_steps = 0;
     int32_t post_edit_steps = 0;
     bool cache_matches_current_tokens = false;
+    const torch::Tensor initial_block_tokens =
+        (enable_prefix_cache
+             ? cur_tokens
+             : cur_tokens.slice(1, block_range.start, block_range.end))
+            .clone();
+    const torch::Tensor prompt_mask_in_block =
+        decode_algorithm.build_prompt_mask_in_block(
+            initial_block_tokens.squeeze(0));
+    const bool initial_has_mask =
+        initial_block_tokens.eq(decode_algorithm.config().mask_id)
+            .any()
+            .item<bool>();
+    DlmModelInputParams::ReqPhase req_phase =
+        num_block == prefill_blocks
+            ? (initial_has_mask
+                   ? DlmModelInputParams::ReqPhase::kIncomingDecode
+                   : DlmModelInputParams::ReqPhase::kIncomingPrefill)
+            : (initial_has_mask
+                   ? DlmModelInputParams::ReqPhase::kStagingDecode
+                   : DlmModelInputParams::ReqPhase::kStagingPrefill);
     while (true) {
       ++refine_steps;
       ++total_refine_steps;
@@ -365,18 +418,18 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
         break;
       }
 
-      torch::Tensor prompt_mask_in_block =
-          decode_algorithm.build_prompt_mask_in_block(
-              bool_options, block_range, prompt_length);
-
       torch::Tensor active_logits =
           enable_prefix_cache
               ? run_cached_block_forward(cur_tokens,
                                          cur_positions,
                                          block_range,
+                                         req_phase,
                                          /*update_cache=*/false)
-              : run_full_window_forward(
-                    cur_tokens, cur_positions, full_window_attn_mask)
+              : run_full_window_forward(cur_tokens,
+                                        cur_positions,
+                                        req_phase,
+                                        block_range.start,
+                                        full_window_attn_mask)
                     .slice(1, block_range.start, block_range.end);
       cache_matches_current_tokens = true;
       if (decode_algorithm.config().algorithm ==
@@ -417,6 +470,7 @@ std::optional<ForwardOutput> RecWorkerImpl::DlmDecodePipeline::step(
         (void)run_cached_block_forward(cur_tokens,
                                        cur_positions,
                                        block_range,
+                                       req_phase,
                                        /*update_cache=*/true);
       } else if (prefix_cache_manager.committed_prefix_length() <
                  block_range.end) {
